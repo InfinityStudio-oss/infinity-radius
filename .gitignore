@@ -91,9 +91,17 @@ apps/network-agent/routers.yaml
 
 # Local DB / temp
 *.sqlite
+*.sql.gz
+*.dump
+*.backup
 tmp/
 temp/
+*.tmp
 
 # Misc
 coverage/
 .env.vercel
+
+# CLI project links (project/org IDs, not secrets, but not repo content either)
+.vercel/
+.railway/
