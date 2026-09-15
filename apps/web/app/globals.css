@@ -1,0 +1,167 @@
+@import "tailwindcss";
+@import "@infinity-radius/config/design-tokens.css";
+
+/**
+ * Tailwind v4's zero-config content scanner only walks this file's own
+ * package root (apps/web) — it never sees packages/ui/src, a SIBLING
+ * package outside that tree. Every shared component (AppShell, Sidebar,
+ * TopBar, MetricCard, ...) lives there, so any utility class that's only
+ * ever written inside packages/ui — never coincidentally duplicated
+ * verbatim somewhere in apps/web — silently generated no CSS at all.
+ * This is why `lg:pl-72` (AppShell's content offset), `lg:left-72`
+ * (TopBar), `lg:translate-x-0` (Sidebar's desktop/mobile transform), and
+ * even the Sidebar's own `w-72` were computing to 0/none/wrong-width in
+ * the browser despite the class being present in the DOM — confirmed via
+ * a headless-Chrome layout dump. `@source` tells the scanner to also
+ * walk this directory so every class actually used there gets generated.
+ */
+@source "../../../packages/ui/src";
+
+@theme {
+  --color-border: var(--color-outline-variant);
+}
+
+body {
+  background-color: var(--color-surface);
+  color: var(--color-on-surface);
+  /* This app is a fixed-sidebar layout everywhere (public header, tenant
+     dashboard, super admin) — there is never a legitimate reason for the
+     page itself to scroll horizontally. Any element that's momentarily
+     too wide (a fixed-width search box, a wide table) would otherwise
+     make the whole page horizontally scrollable, and since the sidebar is
+     `position: fixed`, scrolling right then visually shifts main content
+     left underneath it. Tables/lists that need their own horizontal
+     scroll already wrap themselves in their own `overflow-x-auto`
+     container (see DataTable), so this only removes an unwanted escape
+     hatch, never a needed one. */
+  overflow-x: hidden;
+}
+
+/**
+ * Super Admin interface only — see components/super-admin/super-admin-shell.tsx.
+ * `.super-admin-scope` wraps the whole shell (sidebar + top bar + main) and
+ * sets Times New Roman for every descendant, regardless of which font
+ * utility a shared component happens to use — an unlayered rule always
+ * beats a Tailwind utility (which lives inside @layer utilities) in the
+ * cascade, so this can't be quietly overridden by a component's own
+ * `font-sans`/`font-mono` class.
+ */
+.super-admin-scope,
+.super-admin-scope * {
+  font-family: "Times New Roman", Times, serif;
+}
+
+/**
+ * `.super-admin-light` is applied narrowly to the top bar + main content
+ * wrapper only (never the sidebar, which stays dark navy) — see
+ * AppShell's `contentClassName` prop. Every shared component already
+ * reads color via these `--color-*` custom properties (bg-surface-*,
+ * text-on-surface*, border-outline-variant, ...), so redefining them here
+ * re-themes the whole content area to a light, professional palette with
+ * no changes needed to the components themselves, and with zero effect on
+ * the Tenant Dashboard, which never sets this class.
+ */
+.super-admin-light {
+  --color-surface: #ffffff;
+  --color-surface-dim: #f3f4f9;
+  --color-surface-bright: #ffffff;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #ffffff;
+  --color-surface-container: #f8f9fc;
+  --color-surface-container-high: #f1f2f8;
+  --color-surface-container-highest: #e7e9f2;
+  --color-surface-variant: #eef0f6;
+  --color-background: #ffffff;
+  --color-on-surface: #16182c;
+  --color-on-surface-variant: #5b5e74;
+  --color-on-background: #16182c;
+  --color-outline: #9296ab;
+  --color-outline-variant: #e2e4ee;
+  /* --color-error is a light pink tuned for dark backgrounds (Material
+     dark-theme "error" role) — unreadable as text on white, so it's the
+     one status token that also needs a light-mode value here. */
+  --color-error: #dc2626;
+  --color-on-error: #ffffff;
+}
+
+/**
+ * Tenant Dashboard interface only — see
+ * components/dashboard/dashboard-shell.tsx. Same two-class mechanism as
+ * the Super Admin interface above (`.tenant-scope` forces Times New Roman
+ * everywhere, `.tenant-light` re-themes the top bar + main content to a
+ * white workspace via the same `--color-*` custom properties every shared
+ * component already reads) — deliberately separate class names so this
+ * can't accidentally change Super Admin, and vice versa.
+ */
+.tenant-scope,
+.tenant-scope * {
+  font-family: "Times New Roman", Times, serif;
+}
+
+.tenant-light {
+  --color-surface: #ffffff;
+  --color-surface-dim: #f3f4f9;
+  --color-surface-bright: #ffffff;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #ffffff;
+  --color-surface-container: #f8f9fc;
+  --color-surface-container-high: #f1f2f8;
+  --color-surface-container-highest: #e7e9f2;
+  --color-surface-variant: #eef0f6;
+  --color-background: #ffffff;
+  --color-on-surface: #16182c;
+  --color-on-surface-variant: #5b5e74;
+  --color-on-background: #16182c;
+  --color-outline: #9296ab;
+  --color-outline-variant: #e2e4ee;
+  --color-error: #dc2626;
+  --color-on-error: #ffffff;
+
+  /* The shared primary/secondary/tertiary tokens are pale, dark-theme
+     "text-on-dark-surface" tones (e.g. --color-primary: #c0c1ff) — fine as
+     an icon tint against navy, unreadable as a solid brand accent against
+     white. Re-pinned here to solid, white-workspace-appropriate shades so
+     every accent icon badge, chart line, progress bar, and solid
+     "bg-primary-container text-on-primary-container" button already in
+     the shared components reads correctly with no component changes.
+     Primary is the sidebar's own dark navy (#151b2b, --color-surface-
+     container-low in the base dark theme) rather than violet, per explicit
+     request — this affects every "primary"-accented element uniformly:
+     Add Router / primary buttons, the active Collections/Sessions tab, the
+     avatar circle, and also the "Today's Collections"/"Available Wallet
+     Balance" KPI icon accents and the collections trend chart line, since
+     they all read this same token. */
+  --color-primary: #151b2b;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #151b2b;
+  --color-on-primary-container: #ffffff;
+  --color-secondary: #0891b2;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #0891b2;
+  --color-on-secondary-container: #ffffff;
+  --color-tertiary: #2563eb;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #2563eb;
+  --color-on-tertiary-container: #ffffff;
+}
+
+/**
+ * The tenant sidebar's active nav item, restyled to match the softer,
+ * translucent highlight already used by the documentation page's own dark
+ * sidebar (components/docs/docs-sidebar.tsx: `bg-primary-container/15
+ * text-primary`) instead of the shared Sidebar component's default solid,
+ * glowing pill — which is the right look for Super Admin's sidebar but
+ * reads as too heavy/bright here. Scoped to `.tenant-scope aside` and
+ * keyed off the real `aria-current="page"` attribute NavLink already
+ * sets, so this is a pure CSS restyle with zero changes to the shared
+ * Sidebar/NavLink component — Super Admin's sidebar (`.super-admin-scope`)
+ * is untouched. The sidebar itself is never inside `.tenant-light`, so
+ * `--color-primary`/`--color-primary-container` here are still the base
+ * dark-theme tokens (#c0c1ff / #8083ff) — the exact same values the docs
+ * sidebar's "dark" variant reads, for an identical result. */
+.tenant-scope aside a[aria-current="page"] {
+  background-color: color-mix(in srgb, var(--color-primary-container) 15%, transparent);
+  color: var(--color-primary);
+  font-weight: 600;
+  box-shadow: none;
+}

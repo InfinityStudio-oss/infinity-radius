@@ -1,0 +1,23 @@
+# Network Agent router registry — EXAMPLE ONLY.
+#
+# The FastAPI backend sends this agent a router UUID and nothing else; this
+# file is what the agent uses to turn that UUID into a real WireGuard
+# tunnel address + RouterOS API credentials. Never commit the real file
+# (see the root .gitignore) — copy this to routers.yaml next to it and
+# fill in real entries as routers are provisioned (see
+# infrastructure/scripts/add-router-peer.sh, which prints the block to add
+# here for each new router).
+#
+# The key MUST be the same UUID as that router's `public.routers.id` row
+# in the primary (Supabase) database — that's what lets the FastAPI
+# backend's request ("do X to router <uuid>") resolve to the right device
+# here without ever passing connection details over the wire itself.
+
+routers:
+  00000000-0000-0000-0000-000000000000:
+    host: 10.90.0.2 # WireGuard tunnel IP — never a public address
+    username: infinity-radius-agent
+    password: "<real RouterOS API user password, never committed>"
+    api_port: 8728
+    api_ssl_port: 8729
+    use_ssl: true

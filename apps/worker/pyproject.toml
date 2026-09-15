@@ -1,0 +1,45 @@
+[project]
+name = "infinity-radius-worker"
+version = "0.1.0"
+description = "Infinity Radius — Celery worker & beat scheduler (async/background jobs)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "celery>=5.4,<6.0",
+  "redis>=5.2,<6.0",
+  "pydantic>=2.10,<3.0",
+  "pydantic-settings>=2.7,<3.0",
+  "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.8,<1.0",
+  "mypy>=1.13,<2.0",
+  "pytest>=8.3,<9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["celery.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

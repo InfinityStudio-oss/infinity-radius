@@ -1,0 +1,18 @@
+# Infinity Radius FreeRADIUS dictionary.
+#
+# Pulls in FreeRADIUS's own stock dictionary (which defines the standard
+# RFC 2865/2866 attributes: Session-Timeout, Idle-Timeout, ...) plus the
+# MikroTik vendor dictionary (Mikrotik-Rate-Limit and the rest of vendor
+# 14988's attributes) that ships with every FreeRADIUS install — neither is
+# hand-authored here, since redefining a vendor attribute's number incorrectly
+# would silently corrupt what's sent to routers.
+#
+# On a stock Debian/Ubuntu FreeRADIUS install these live in
+# /usr/share/freeradius/ — a bare `$INCLUDE dictionary.mikrotik` resolves
+# relative to this file's own directory (/etc/freeradius/3.0), NOT the
+# dictionary search path, so it must be the full path (confirmed against a
+# real FreeRADIUS 3.2.5 install on Ubuntu 24.04 — the short form fails with
+# "Couldn't open dictionary ... No such file or directory").
+
+$INCLUDE /usr/share/freeradius/dictionary
+$INCLUDE /usr/share/freeradius/dictionary.mikrotik

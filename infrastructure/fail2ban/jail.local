@@ -1,0 +1,29 @@
+# Fail2ban jails for the Network VPS. Copy to /etc/fail2ban/jail.local.
+#
+# Only sshd and the Caddy-fronted Network Agent are internet-facing (see
+# infrastructure/scripts/provision-vps.sh's UFW rules) — FreeRADIUS and
+# WireGuard are UDP services not meaningfully covered by Fail2ban's
+# log-pattern model, and are protected instead by only listening on the
+# WireGuard interface / requiring a valid peer key.
+
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled = true
+port    = ssh
+
+[caddy-auth]
+enabled  = true
+port     = http,https
+filter   = caddy-auth
+logpath  = /var/log/caddy/network-agent-access.log
+# The Network Agent itself returns 401 for a bad/replayed signature and 403
+# for an IP outside the allowlist — this jail bans an IP that racks up
+# enough of either through the reverse proxy's access log.
+maxretry = 10
+findtime = 5m
+bantime  = 1h

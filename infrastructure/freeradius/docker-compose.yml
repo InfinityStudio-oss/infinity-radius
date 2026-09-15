@@ -1,0 +1,50 @@
+# Local dev only — runs FreeRADIUS + its own Postgres so you can test the
+# Network Agent / hotspot flow without the Network VPS. Production does NOT
+# use this file: FreeRADIUS and Postgres run directly on the Network VPS,
+# and FreeRADIUS binds only to the WireGuard interface, never 0.0.0.0 (see
+# raddb/sites-available/default) — this override is a local-dev-only
+# convenience since there's no WireGuard interface inside the container.
+#
+# Usage:
+#   cp .env.example .env   # then fill in a real local password
+#   docker compose up
+
+services:
+  radius-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${RADIUS_DB_NAME:-radius}
+      POSTGRES_USER: ${RADIUS_DB_USER:-radius}
+      POSTGRES_PASSWORD: ${RADIUS_DB_PASSWORD:?set RADIUS_DB_PASSWORD in .env}
+    volumes:
+      - radius_postgres_data:/var/lib/postgresql/data
+      - ./schema/0001_radius_schema.sql:/docker-entrypoint-initdb.d/0001_radius_schema.sql:ro
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  freeradius:
+    image: freeradius/freeradius-server:3.2.5
+    restart: unless-stopped
+    depends_on:
+      - radius-postgres
+    environment:
+      RADIUS_DB_HOST: radius-postgres
+      RADIUS_DB_PORT: "5432"
+      RADIUS_DB_NAME: ${RADIUS_DB_NAME:-radius}
+      RADIUS_DB_USER: ${RADIUS_DB_USER:-radius}
+      RADIUS_DB_PASSWORD: ${RADIUS_DB_PASSWORD:?set RADIUS_DB_PASSWORD in .env}
+      # Local-dev-only override — see the file header. Production sets this
+      # to the WireGuard interface address instead.
+      RADIUS_LISTEN_ADDR: "0.0.0.0"
+    volumes:
+      - ./raddb/dictionary:/etc/raddb/dictionary:ro
+      - ./raddb/mods-available/sql:/etc/raddb/mods-available/sql:ro
+      - ./raddb/sites-available/default:/etc/raddb/sites-available/default:ro
+      - ./raddb/clients.conf.example:/etc/raddb/clients.conf:ro
+    ports:
+      - "127.0.0.1:1812:1812/udp"
+      - "127.0.0.1:1813:1813/udp"
+
+volumes:
+  radius_postgres_data:

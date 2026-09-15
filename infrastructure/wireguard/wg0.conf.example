@@ -1,0 +1,14 @@
+# Network VPS WireGuard server interface — EXAMPLE ONLY.
+# Copy to wg0.conf on the Network VPS, generate real keys with `wg genkey`,
+# and never commit the real file (see infrastructure/wireguard/README.md).
+
+[Interface]
+Address = 10.90.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private-key>
+
+# One [Peer] block per MikroTik router, added by the (future) peer
+# provisioning script in infrastructure/scripts/.
+# [Peer]
+# PublicKey = <router-public-key>
+# AllowedIPs = 10.90.0.2/32

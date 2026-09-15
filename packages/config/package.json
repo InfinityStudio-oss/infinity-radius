@@ -1,0 +1,16 @@
+{
+  "name": "@infinity-radius/config",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Shared TypeScript, ESLint, and Tailwind configuration for Infinity Radius apps",
+  "files": [
+    "tsconfig.base.json",
+    "eslint-preset.js",
+    "design-tokens.css"
+  ],
+  "exports": {
+    "./tsconfig.base.json": "./tsconfig.base.json",
+    "./eslint-preset": "./eslint-preset.js",
+    "./design-tokens.css": "./design-tokens.css"
+  }
+}

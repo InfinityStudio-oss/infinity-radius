@@ -1,0 +1,73 @@
+# SQL module — points FreeRADIUS at the RADIUS PostgreSQL database.
+#
+# Connection details come from the environment (never hard-coded — see the
+# root instruction against committing real secrets). On the Network VPS
+# these are set in /etc/freeradius/3.0/radius_db.env, loaded by the
+# freeradius systemd unit's EnvironmentFile= directive; docker-compose.yml
+# passes them as container env vars for local dev instead.
+#
+# Query definitions are NOT redefined here — this $INCLUDEs FreeRADIUS's
+# own stock postgresql queries.conf (ships with every install at
+# ${modconfdir}/sql/main/postgresql/queries.conf), which already matches
+# the schema in schema/0001_radius_schema.sql column-for-column. Hand-
+# rewriting those queries would risk drifting from what the schema
+# actually supports.
+
+sql {
+    driver = "rlm_sql_postgresql"
+    dialect = "postgresql"
+
+    # $ENV{...}, not ${env:...} — the latter is a reference to another
+    # config item literally named "env" (fails with `Reference "${env}"
+    # not found`), not an environment-variable read. Confirmed against a
+    # real FreeRADIUS 3.2.5 install on Ubuntu 24.04.
+    server = "$ENV{RADIUS_DB_HOST}"
+    port = "$ENV{RADIUS_DB_PORT}"
+    login = "$ENV{RADIUS_DB_USER}"
+    password = "$ENV{RADIUS_DB_PASSWORD}"
+    radius_db = "$ENV{RADIUS_DB_NAME}"
+
+    # Match the app's convention (never commit a real secret) — this file
+    # is safe to check in precisely because it contains no values, only
+    # variable references.
+
+    acct_table1 = "radacct"
+    acct_table2 = "radacct"
+    postauth_table = "radpostauth"
+    authcheck_table = "radcheck"
+    authreply_table = "radreply"
+    groupcheck_table = "radgroupcheck"
+    groupreply_table = "radgroupreply"
+    usergroup_table = "radusergroup"
+    # Both required by FreeRADIUS's own stock postgresql queries.conf
+    # (client_query references ${client_table}; the group queries
+    # reference ${group_attribute}) — omitting them fails module
+    # instantiation with "Reference ... not found". client_table = "nas"
+    # matches this schema; group_attribute = "SQL-Group" is FreeRADIUS's
+    # own long-standing default name for this module instance.
+    client_table = "nas"
+    group_attribute = "SQL-Group"
+
+    read_groups = yes
+    read_profiles = no
+    delete_stale_sessions = yes
+
+    pool {
+        start = 5
+        min = 3
+        max = 32
+        spare = 8
+        uses = 0
+        lifetime = 0
+        idle_timeout = 60
+    }
+
+    # Simultaneous-Use enforcement (packages.simultaneous_sessions — see
+    # schema/mikrotik_attributes.md) — counts open radacct rows for the
+    # user. Requires `session { sql }` in sites-available/default, which
+    # this repo's site config includes.
+    simul_count_query = "SELECT COUNT(*) FROM radacct WHERE username = '%{SQL-User-Name}' AND acctstoptime IS NULL"
+    simul_verify_query = "SELECT radacctid, acctsessionid, username, nasipaddress, nasportid, framedipaddress, callingstationid, framedprotocol FROM radacct WHERE username = '%{SQL-User-Name}' AND acctstoptime IS NULL"
+
+    $INCLUDE ${modconfdir}/${.:name}/main/${dialect}/queries.conf
+}

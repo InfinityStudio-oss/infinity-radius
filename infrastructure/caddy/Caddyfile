@@ -1,0 +1,29 @@
+# Reverse proxy in front of the Network Agent on the Network VPS.
+#
+# Caddy terminates TLS (automatic Let's Encrypt cert for the domain below)
+# and forwards to the Network Agent, which listens on localhost only — the
+# agent's own process is never bound to a public interface. This is on top
+# of, not instead of, the Network Agent's own request signing (HMAC +
+# timestamp + nonce, see apps/network-agent/app/core/security.py) and the
+# Railway static-IP allowlist (see apps/network-agent/app/core/config.py) —
+# defense in depth, not a substitute for either.
+#
+# Replace network-agent.example.com with the real subdomain before use.
+# Real Railway static outbound IPs are never committed here — set them via
+# ALLOWED_SOURCE_IPS in the Network Agent's own .env, checked in the app
+# itself so a Caddy config typo can't silently disable the allowlist.
+
+network-agent.example.com {
+    encode gzip
+
+    # /health is the only endpoint that skips this proxy's TLS client
+    # requirement — it's used by the VPS's own local uptime monitoring
+    # and carries no sensitive data (see app/routers/health.py).
+    reverse_proxy 127.0.0.1:8100 {
+        header_up X-Forwarded-For {remote_host}
+    }
+
+    log {
+        output file /var/log/caddy/network-agent-access.log
+    }
+}

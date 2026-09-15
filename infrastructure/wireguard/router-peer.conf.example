@@ -1,0 +1,23 @@
+# MikroTik-side WireGuard peer config — EXAMPLE ONLY.
+#
+# RouterOS 7 has native WireGuard support (no separate package needed).
+# This file documents the equivalent RouterOS CLI commands rather than a
+# wg-quick .conf, since that's how a router is actually provisioned. Real
+# keys are generated per-router by infrastructure/scripts/add-router-peer.sh
+# and are never committed.
+#
+# /interface/wireguard add name=wg-radius listen-port=51820 private-key="<router-private-key>"
+# /interface/wireguard/peers add interface=wg-radius \
+#     public-key="<network-vps-public-key>" \
+#     endpoint-address=<network-vps-public-ip> endpoint-port=51820 \
+#     allowed-address=10.90.0.0/24 persistent-keepalive=25s
+# /ip/address add address=10.90.0.2/32 interface=wg-radius
+#
+# The router's RADIUS client config then points at the VPS's tunnel address:
+# /radius add service=hotspot address=10.90.0.1 secret="<per-router-shared-secret>" \
+#     authentication-port=1812 accounting-port=1813
+# /ip/hotspot/profile set [find] use-radius=yes
+#
+# `10.90.0.2` (this router) must match the AllowedIPs assigned to it in the
+# Network VPS's wg0.conf (see add-router-peer.sh) and the `ipaddr` used in
+# infrastructure/freeradius/raddb/clients.conf for this router's client block.

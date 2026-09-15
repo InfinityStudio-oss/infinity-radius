@@ -1,0 +1,45 @@
+# systemd unit for the Network Agent on the Network VPS.
+# Copy to /etc/systemd/system/infinity-radius-network-agent.service, then:
+#   systemctl daemon-reload && systemctl enable --now infinity-radius-network-agent
+#
+# Deployment path is /opt/infinity-radius/network-agent (no "apps/" prefix)
+# — this repo's own apps/network-agent is copied there directly, not the
+# whole monorepo — see infrastructure/scripts/deploy-network-agent.sh.
+# Confirmed against the first real deployment (infinity-radius-network-01,
+# 2026-09-14).
+
+[Unit]
+Description=Infinity Radius Network Agent
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=network-agent
+Group=network-agent
+WorkingDirectory=/opt/infinity-radius/network-agent
+EnvironmentFile=/opt/infinity-radius/network-agent/.env
+# Binds to 127.0.0.1 only — Caddy (infrastructure/caddy/Caddyfile) is the
+# only public-facing entry point, terminating TLS in front of this process.
+ExecStart=/opt/infinity-radius/network-agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100
+Restart=on-failure
+RestartSec=5
+
+# Hardening — this process only needs outbound network access (to the
+# WireGuard interface) and its own working directory. CAP_NET_ADMIN is
+# required for the /health endpoint's real `wg show wg0` check (see
+# app/routers/health.py) — without it, `wg show` fails with "Operation not
+# permitted" under an unprivileged user even with NoNewPrivileges unset;
+# ambient capabilities are the minimal, standard way to grant just this
+# one capability instead of running as root.
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/infinity-radius/network-agent
+
+[Install]
+WantedBy=multi-user.target

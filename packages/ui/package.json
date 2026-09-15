@@ -1,0 +1,25 @@
+{
+  "name": "@infinity-radius/ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Shared UI primitives and design-system components for Infinity Radius apps",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "type-check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "next": "^16.3.5",
+    "react": "^19.3.0"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.6.0"
+  },
+  "devDependencies": {
+    "@infinity-radius/config": "workspace:*",
+    "@types/react": "^19.3.0",
+    "next": "^16.3.5",
+    "typescript": "^5.9.3"
+  }
+}

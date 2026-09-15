@@ -1,0 +1,15 @@
+{
+  "name": "@infinity-radius/types",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Shared TypeScript types for Infinity Radius apps",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@infinity-radius/config": "workspace:*",
+    "typescript": "^5.9.3"
+  }
+}

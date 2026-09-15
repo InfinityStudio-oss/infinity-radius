@@ -1,0 +1,23 @@
+# RADIUS clients (NAS) allowed to authenticate/account against this server.
+# EXAMPLE ONLY — copy to clients.conf on the Network VPS and never commit
+# the real file (see infrastructure/wireguard/README.md for the same rule
+# applied to WireGuard keys; the root .gitignore ignores raddb/clients.conf).
+#
+# Every real client entry must also exist as a row in the `nas` table (see
+# schema/0001_radius_schema.sql) if you use rlm_sql's client-loading — this
+# static file form is the simpler alternative for a small number of routers.
+# `ipaddr` here is the router's WireGuard tunnel address, never its public
+# IP — see infrastructure/wireguard/README.md. FreeRADIUS only listens on
+# the WireGuard interface (see sites-available/default), so this is
+# defense in depth, not the only control.
+
+client router-example {
+    ipaddr     = 10.90.0.2
+    secret     = <set-a-real-per-router-secret-operationally-never-here>
+    shortname  = router-example
+    nas_type   = other
+    require_message_authenticator = yes
+}
+
+# One `client { }` block per MikroTik router, added when a router is
+# onboarded (WireGuard peer provisioned via infrastructure/scripts/add-router-peer.sh).

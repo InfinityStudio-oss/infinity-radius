@@ -1,0 +1,69 @@
+# Infinity Radius hotspot RADIUS virtual server.
+#
+# MikroTik hotspot authenticates customers by PAP (username/password
+# submitted through the hotspot login page) — not EAP/802.1X — so this
+# site intentionally has no inner-tunnel/EAP configuration. Listens only
+# on the WireGuard interface (see infrastructure/wireguard/README.md):
+# routers reach this over the private tunnel, never the public internet.
+
+server default {
+    listen {
+        type = auth
+        # $ENV{...}, not ${env:...} — confirmed against a real FreeRADIUS
+        # 3.2.5 install (see raddb/mods-available/sql's comment).
+        ipaddr = $ENV{RADIUS_LISTEN_ADDR}  # WireGuard interface address, e.g. 10.90.0.1
+        port = 1812
+        limit {
+            max_connections = 64
+        }
+    }
+
+    listen {
+        type = acct
+        ipaddr = $ENV{RADIUS_LISTEN_ADDR}
+        port = 1813
+        limit {
+            max_connections = 64
+        }
+    }
+
+    authorize {
+        filter_username
+        preprocess
+
+        # Loads radcheck/radgroupcheck/radreply/radgroupreply for this user
+        # (via radusergroup -> the package's RADIUS group) — see
+        # schema/mikrotik_attributes.md for how a package becomes a group.
+        sql
+
+        pap
+    }
+
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+    }
+
+    preacct {
+        preprocess
+        acct_unique
+    }
+
+    accounting {
+        sql
+    }
+
+    # Enforces radcheck/radgroupcheck's Simultaneous-Use attribute against
+    # currently-open radacct rows (see mods-available/sql's simul_*_query).
+    session {
+        sql
+    }
+
+    post-auth {
+        sql
+        Post-Auth-Type REJECT {
+            sql
+        }
+    }
+}

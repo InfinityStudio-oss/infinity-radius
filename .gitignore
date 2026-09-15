@@ -1,0 +1,99 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+out/
+next-env.d.ts
+
+# Turborepo
+.turbo/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Environment variables — every real env file, of any flavor, is ignored;
+# only the checked-in placeholder examples are ever tracked.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg
+.coverage
+htmlcov/
+
+# Alembic (keep versions, ignore local db)
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets / keys / certificates
+*.pem
+*.key
+*.psk
+*.p12
+*.pfx
+*.crt
+*.csr
+
+# SSH — should never be inside a project directory, but ignored defensively
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+.ssh/
+
+# WireGuard — real server/router config and key material. Named patterns
+# below are redundant with *.key above but kept explicit for clarity.
+infrastructure/wireguard/*.conf
+!infrastructure/wireguard/*.conf.example
+server_private.key
+wg_private.key
+wireguard_private.key
+
+# FreeRADIUS secrets (real clients.conf holds per-router shared secrets)
+infrastructure/freeradius/raddb/clients.conf
+infrastructure/freeradius/.env
+
+# Network Agent router registry (real router credentials)
+apps/network-agent/routers.yaml
+
+# Terraform (not currently used, ignored defensively)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Local DB / temp
+*.sqlite
+tmp/
+temp/
+
+# Misc
+coverage/
+.env.vercel
