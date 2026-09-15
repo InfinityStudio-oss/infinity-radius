@@ -123,3 +123,21 @@ class NetworkAgentClient:
     async def get_radius_status(self, *, router_id: UUID) -> list[RadiusClientStatus]:
         data = await self._request("GET", f"/routers/{router_id}/radius-status")
         return [RadiusClientStatus.model_validate(item) for item in data]
+
+    async def diagnostic_ping(self) -> tuple[bool, int]:
+        """Authenticated reachability probe for the Super Admin diagnostics
+        endpoint. Every Network Agent route requires a router UUID, so this
+        signs a GET against the nil UUID (never a real router) on the
+        cheapest read-only route (`/identity`) and reads the raw status
+        code directly — unlike `_request`, it never raises on 4xx, since a
+        404 here ("Unknown router_id") is itself the expected, successful
+        outcome: it proves the signature and IP allowlist were both
+        accepted before the route body ever ran. Returns
+        (authenticated, status_code); 401/403 means rejected before the
+        route ran, anything else (normally 404) means accepted.
+        """
+        path = "/routers/00000000-0000-0000-0000-000000000000/identity"
+        headers = sign_request(api_key=self._api_key, method="GET", path=path).as_dict()
+        response = await self._client.request("GET", path, headers=headers)
+        authenticated = response.status_code not in (401, 403)
+        return authenticated, response.status_code
