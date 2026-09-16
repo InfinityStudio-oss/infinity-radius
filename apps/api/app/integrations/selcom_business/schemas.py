@@ -32,8 +32,14 @@ class AccountLookupRequest(BaseModel):
 
 
 class AccountLookupData(BaseModel):
-    bank: str | None = None
-    account: str | None = None
+    # `bank`/`account` are documented as simple echoed strings, but the
+    # real sandbox has been observed returning an expanded object for
+    # `account` (organization/account record, not just the number) when a
+    # genuine match is found — never used for anything in this codebase
+    # beyond passthrough, so both stay permissively typed rather than
+    # failing a real successful lookup over a field we don't consume.
+    bank: Any = None
+    account: Any = None
     account_name: str | None = Field(default=None, alias="accountName")
     operator: str | None = None
     charges: list[Any] = Field(default_factory=list)
