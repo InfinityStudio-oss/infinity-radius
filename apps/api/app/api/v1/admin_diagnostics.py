@@ -79,12 +79,12 @@ class SelcomBusinessDiagnosticResult(BaseModel):
     detail: str | None = None
 
 
-# Selcom's own published sandbox test wallet account — see the "Sample Test
-# Accounts" panel in the Selcom Business sandbox portal. Never a real
-# destination; this is the one Selcom itself documents for exactly this
-# kind of connectivity check.
+# Selcom's own published sandbox test account ("Sandbox Selcom to Selcom",
+# Internal Transfer) — see the "Sample Test Accounts" panel in the Selcom
+# Business sandbox portal. Never a real destination; this is the one
+# Selcom itself documents for exactly this kind of connectivity check.
 _SANDBOX_TEST_BANK = "SELCOM"
-_SANDBOX_TEST_ACCOUNT = "1140554577325"
+_SANDBOX_TEST_ACCOUNT = "8774738353235"
 
 
 @router.post(
