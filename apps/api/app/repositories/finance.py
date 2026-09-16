@@ -74,9 +74,24 @@ class WithdrawalRepository(BaseRepository[Withdrawal]):
         return result.scalar_one_or_none()
 
     async def get_by_idempotency_key(self, *, idempotency_key: str) -> Withdrawal | None:
+        """Selcom Business disbursement callbacks/reconciliation identify a
+        withdrawal by the transId WE supplied, which is always this
+        withdrawal's own idempotency_key — see app/services/payouts.py."""
         stmt = select(Withdrawal).where(Withdrawal.idempotency_key == idempotency_key)
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def list_by_statuses(self, *, statuses: list[str]) -> list[Withdrawal]:
+        """Platform-wide (tenant-agnostic) — for the periodic Celery beat
+        reconciliation sweep, see app/services/payouts.py.reconcile_withdrawal."""
+        stmt = select(Withdrawal).where(Withdrawal.status.in_(statuses))
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_pending_super_admin_approval(self) -> list[Withdrawal]:
+        """Every withdrawal currently awaiting SUPER_ADMIN review — the
+        Super Admin withdrawal queue's "Pending Approval" tab."""
+        return await self.list_by_statuses(statuses=["PENDING_APPROVAL"])
 
 
 class WithdrawalEventRepository(BaseRepository[WithdrawalEvent]):

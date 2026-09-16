@@ -7,15 +7,23 @@ callback is saved (audit trail) but never acted on — see
 app.integrations.selcom.collection.CollectionService.process_callback.
 """
 
+import contextlib
+import json
+from datetime import UTC, datetime
+from typing import Any
+
 import structlog
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import NotFoundError
 from app.db.session import get_db
 from app.integrations.selcom.collection import CollectionService
 from app.integrations.selcom.disbursement import SelcomDisbursementService
 from app.integrations.selcom.exceptions import SelcomAPIError, SelcomWebhookVerificationError
+from app.repositories.finance import PaymentWebhookRepository, WithdrawalRepository
 from app.services.captive_portal import selcom_config_from_settings
+from app.services.payouts import PayoutService
 
 logger = structlog.get_logger("webhooks.selcom")
 
@@ -48,6 +56,58 @@ async def selcom_collection_webhook(
 
     await db.commit()
     return {"status": result.status}
+
+
+@router.post("/selcom-business/disbursement")
+async def selcom_business_disbursement_webhook(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> dict[str, str]:
+    """Selcom Business's disbursement callback — developer.selcom.business
+    documents no signature/authentication scheme for it, so this is used
+    only as a SIGNAL to query, never trusted to move money on its own
+    claims (see app/services/payouts.py.reconcile_withdrawal, which
+    re-verifies via an authenticated GET /v1/transaction/query before
+    ever finalizing anything). Always saves the raw callback first,
+    regardless of whether a matching withdrawal is ever found."""
+    body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(body) if body else {}
+    except (ValueError, TypeError):
+        payload = {"_unparsable_body": body.decode("utf-8", errors="replace")}
+
+    webhook_repo = PaymentWebhookRepository(db)
+    webhook = await webhook_repo.create(
+        tenant_id=None,
+        provider="selcom_business_disbursement",
+        payload=payload,
+        signature_verified=False,
+        processed=False,
+    )
+
+    reference_id = payload.get("reference_id")
+    if not isinstance(reference_id, str) or not reference_id:
+        await webhook_repo.update(webhook, processed=True, processed_at=datetime.now(UTC))
+        await db.commit()
+        logger.warning("selcom_business.disbursement_webhook.malformed")
+        return {"status": "malformed"}
+
+    withdrawal_repo = WithdrawalRepository(db)
+    withdrawal = await withdrawal_repo.get_by_idempotency_key(
+        idempotency_key=reference_id
+    ) or await withdrawal_repo.get_by_provider_reference(provider_reference=reference_id)
+    if withdrawal is None:
+        await webhook_repo.update(webhook, processed=True, processed_at=datetime.now(UTC))
+        await db.commit()
+        logger.warning("selcom_business.disbursement_webhook.unknown_reference")
+        return {"status": "unknown_reference"}
+
+    await webhook_repo.update(webhook, tenant_id=withdrawal.tenant_id)
+
+    with contextlib.suppress(NotFoundError):
+        await PayoutService(db).reconcile_withdrawal(withdrawal_id=withdrawal.id)
+    await webhook_repo.update(webhook, processed=True, processed_at=datetime.now(UTC))
+    await db.commit()
+    return {"status": "acknowledged"}
 
 
 @router.post("/selcom/disbursement")

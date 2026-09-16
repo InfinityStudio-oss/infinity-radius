@@ -13,7 +13,7 @@ celery_app = Celery(
     "infinity_radius",
     broker=str(settings.redis_url),
     backend=str(settings.redis_url),
-    include=[],  # task modules are registered as business logic is added
+    include=["app.tasks.reconciliation"],
 )
 
 celery_app.conf.update(
@@ -24,3 +24,15 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
 )
+
+# Run with `celery -A app.core.celery_app worker` / `... beat` from apps/api
+# — this app instance (not apps/worker's) owns the task, since it needs the
+# full API app's DB/service layer. Every 2 minutes: comfortably inside
+# NetworkAgentSettings-style bounds without hammering Selcom, while still
+# resolving a PROCESSING/AMBIGUOUS withdrawal well within a support SLA.
+celery_app.conf.beat_schedule = {
+    "reconcile-pending-withdrawals": {
+        "task": "infinity_radius.reconcile_pending_withdrawals",
+        "schedule": 120.0,
+    },
+}

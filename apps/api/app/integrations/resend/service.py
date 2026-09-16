@@ -9,6 +9,7 @@ action that already succeeded in the database.
 """
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 import structlog
@@ -19,6 +20,7 @@ from app.integrations.resend.config import ResendConfig
 from app.integrations.resend.exceptions import ResendError
 from app.integrations.resend.schemas import EmailSendResult
 from app.integrations.resend.templates import onboarding as templates
+from app.integrations.resend.templates import withdrawals as withdrawal_templates
 
 logger = structlog.get_logger("app.integrations.resend")
 
@@ -142,4 +144,42 @@ class ResendEmailService:
         )
         return await self._send(
             to=to, subject=subject, html=html, log_context="tenant_reactivated"
+        )
+
+    async def send_admin_withdrawal_review_email(
+        self,
+        *,
+        withdrawal_id: UUID,
+        tenant_name: str,
+        amount: Decimal,
+        currency: str,
+        destination_channel: str,
+        destination_code: str | None,
+        masked_account: str | None,
+        withdrawal_reference: str,
+        requested_at: datetime,
+    ) -> EmailSendResult:
+        if not self._config.super_admin_review_email:
+            return EmailSendResult(
+                sent=False,
+                provider_message_id=None,
+                error_message="SUPER_ADMIN_REVIEW_EMAIL is not configured",
+            )
+        subject, html = withdrawal_templates.admin_withdrawal_review_email(
+            app_url=self._config.app_url,
+            withdrawal_id=withdrawal_id,
+            tenant_name=tenant_name,
+            amount=amount,
+            currency=currency,
+            destination_channel=destination_channel,
+            destination_code=destination_code,
+            masked_account=masked_account,
+            withdrawal_reference=withdrawal_reference,
+            requested_at=requested_at,
+        )
+        return await self._send(
+            to=self._config.super_admin_review_email,
+            subject=subject,
+            html=html,
+            log_context="admin_withdrawal_review",
         )

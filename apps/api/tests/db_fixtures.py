@@ -170,13 +170,16 @@ class SeededContext:
             )
         return verification_id
 
-    def new_tenant_feature_flags(self, *, tenant_id: UUID) -> UUID:
+    def new_tenant_feature_flags(
+        self, *, tenant_id: UUID, payout_enabled: bool = False
+    ) -> UUID:
         assert self._conn is not None
         flags_id = uuid4()
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO public.tenant_feature_flags (id, tenant_id) VALUES (%s, %s)",
-                (flags_id, tenant_id),
+                "INSERT INTO public.tenant_feature_flags (id, tenant_id, payout_enabled) "
+                "VALUES (%s, %s, %s)",
+                (flags_id, tenant_id, payout_enabled),
             )
         return flags_id
 

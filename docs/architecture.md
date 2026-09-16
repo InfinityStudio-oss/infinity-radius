@@ -318,80 +318,124 @@ it legally or commercially holds tenant money:
    withdrawal is requested and again immediately before submission, so
    flipping it off mid-flight can't be raced.
 
-### Withdrawal lifecycle (maker-checker)
+### Withdrawal lifecycle (threshold-gated Super Admin approval)
 
 Three tables: `withdrawals` (the request itself), `withdrawal_destinations`
-(mobile money/bank targets a tenant configured), `withdrawal_events` (an
-immutable, ordered log of every status transition — distinct from
-`ledger_entries`, which only records money movement).
+(mobile money/bank/Selcom targets a tenant configured, each carrying a
+canonical `destination_code` — `app.core.enums.DestinationCode`, the one
+source of Selcom FI codes), `withdrawal_events` (an immutable, ordered log
+of every status transition — distinct from `ledger_entries`, which only
+records money movement).
 
-`withdrawals.status` is one of nine values
-(`app.core.enums.WithdrawalStatus`), enforced by a Postgres CHECK
-constraint:
+`withdrawals.status` is one of ten values (`app.core.enums.WithdrawalStatus`),
+enforced by a Postgres CHECK constraint:
 
 ```
-DRAFT -> PENDING_APPROVAL -> APPROVED -> PROCESSING -> SUCCESS
-                                                      -> FAILED
-                  -> REJECTED          (checker declines)
+DRAFT -> APPROVED -> PROCESSING -> SUCCESS                 (<= threshold, auto)
+                                 -> AMBIGUOUS -> SUCCESS/FAILED  (resultcode 999, query-resolved)
+                                 -> FAILED
+DRAFT -> PENDING_APPROVAL -> APPROVED -> PROCESSING -> ...  (> threshold, SUPER_ADMIN)
+                           -> REJECTED                      (SUPER_ADMIN declines)
 DRAFT -> CANCELLED                     (2FA exhausted/expired, or requester cancels)
 SUCCESS -> REVERSED                    (super admin only, exceptional)
 ```
+
+**Approval is a pure amount threshold**
+(`Settings.selcom_withdrawal_approval_threshold_tzs`, default `100000`,
+server-side only — never a frontend control): `amount <= threshold` skips
+human approval entirely; `amount > threshold` requires a `SUPER_ADMIN` —
+**never** a tenant user, and never the requester. `approval_required` is
+computed once, at request time, and persisted on the row so a later
+threshold change never rewrites a past withdrawal's history. 2FA
+(`app/services/two_factor.py`) is unrelated to approval and unchanged —
+it confirms the *requester's own* identity, independent of who (if anyone)
+later reviews the amount.
 
 The full flow (`app/services/payouts.py`'s `PayoutService`), every step
 row-locked (`WithdrawalRepository.get_by_id_for_update`) and every
 transition written as a `WithdrawalEvent` + an `audit_logs` entry:
 
-1. **`request_withdrawal`** (`TENANT_OWNER` only) — verifies the
-   settlement mode and the disbursement flag, then row-locks and reserves
-   the amount (`WalletService.reserve_for_withdrawal`, `available ->
-   reserved`) *before* anything else, and issues a one-time 2FA challenge.
-   A server-generated `idempotency_key` (never client-supplied) is stamped
-   on the row once, here, and never regenerated.
-2. **`confirm_two_factor`** (requester only) — verifies the code
-   (`app/services/two_factor.py`: hashed, 10-minute TTL, 5-attempt limit).
-   A wrong code's attempt-increment is committed even though the HTTP
-   response is a 422 — only a genuinely exhausted/expired challenge
+1. **`request_withdrawal`** (`TENANT_OWNER` only) — verifies settlement
+   mode, the disbursement flag, and the tenant's `payout_enabled` feature
+   flag (`tenant_feature_flags` — approval status never overrides this),
+   then row-locks and reserves the amount (`WalletService.
+   reserve_for_withdrawal`, `available -> reserved`) *before* anything
+   else, computes and stores `approval_required`, and issues a one-time
+   2FA challenge. A server-generated `idempotency_key` (never
+   client-supplied) is stamped on the row once, here, and never
+   regenerated — it becomes Selcom's own `transId`.
+2. **`confirm_two_factor`** (requester only) — verifies the code. On
+   success: `approval_required` withdrawals move to `PENDING_APPROVAL`
+   and a Super Admin review email goes out (Resend,
+   `send_admin_withdrawal_review_email`); everything else moves straight
+   to `APPROVED` and calls `_submit_to_selcom` immediately — no human step
+   at all. A wrong code's attempt-increment is committed even though the
+   HTTP response is a 422 — only a genuinely exhausted/expired challenge
    auto-cancels the withdrawal and releases the reservation.
-3. **`approve_withdrawal` / `reject_withdrawal`** (`TENANT_OWNER` or
-   `TENANT_ADMIN`, **never** the original requester — enforced in the
-   service layer, not just by role) — reject releases the reservation;
-   approve immediately attempts submission.
-4. **`_submit_to_selcom`** — never re-entrant: it only ever runs once,
-   immediately after the APPROVED transition, and the very first thing it
-   does is move the row to `PROCESSING`, so even a concurrent/duplicate
-   call sees a non-`APPROVED` status and refuses to submit again ("never
-   retry payout submission blindly"). Calls
-   `SelcomDisbursementService.initiate_disbursement` with the stored
-   idempotency key as the reference; today that always raises
-   `SelcomNotConfiguredError`/`SelcomNotImplementedError` (see below), which
-   this catches and turns into `FAILED` + a released reservation — never a
-   silently stuck `PROCESSING` row.
-5. **`apply_disbursement_result`** — called only from a genuinely verified
-   Selcom callback (`POST /api/v1/webhooks/selcom/disbursement`). Success
-   calls `WalletService.complete_disbursement` (`reserved ->
-   total_disbursed`, a `DISBURSEMENT` ledger entry) and moves the
-   withdrawal to `SUCCESS`; failure releases the reservation and moves it
-   to `FAILED`. Idempotent: only acts while status is still `PROCESSING`.
+3. **`approve_withdrawal` / `reject_withdrawal`** (`SUPER_ADMIN` only —
+   `app/api/v1/admin_withdrawals.py`, cross-tenant lookup) — reject
+   releases the reservation; approve immediately attempts submission.
+4. **`_submit_to_selcom`** — never re-entrant (same "never retry payout
+   submission blindly" guarantee as before). Re-verifies the destination
+   via `GET /v1/account/lookup` (a fresh `transId`) immediately before
+   transferring — the resulting `accountName` is the *only* source of
+   `verified_recipient_name`, never a client-supplied value — then moves
+   to `PROCESSING` and calls `POST /v1/transaction/process` exactly once
+   with `purpose="FT"`. A transport-level failure (timeout/connection
+   error) never marks the row FAILED and never resubmits — it queries
+   Selcom with the same `transId` instead (`_reconcile_locked`).
+5. **`_apply_provider_result`** — interprets a Selcom resultcode
+   (`000`=SUCCESS, `111`/`927`=INPROGRESS, `999`=AMBIGUOUS, anything else
+   =FAIL — `interpret_resultcode`) from any of three sources: the direct
+   `transaction/process` response, a reconciliation `transaction/query`,
+   or a webhook-triggered query. SUCCESS calls
+   `WalletService.complete_disbursement` (`reserved -> total_disbursed`,
+   a `DISBURSEMENT` entry) and cross-checks the provider-reported amount
+   against the withdrawal before finalizing — a mismatch becomes
+   `AMBIGUOUS`, never a silent finalize. INPROGRESS leaves it `PROCESSING`.
+   AMBIGUOUS is never retried — only resolved by a later query. FAIL
+   releases the reservation. Idempotent throughout: only acts while
+   status is `PROCESSING`/`AMBIGUOUS`.
 6. **`reverse_withdrawal`** (super admin only, under
-   `/api/v1/tenants/{tenant_id}/withdrawals/{withdrawal_id}/reverse`) — the
-   exceptional path for an already-`SUCCESS`'d disbursement that turns out
-   to be wrong (bad account, provider recall):
-   `WalletService.reverse_disbursement` (`total_disbursed -> available`, a
+   `/api/v1/tenants/{tenant_id}/withdrawals/{withdrawal_id}/reverse`,
+   unchanged) — the exceptional path for an already-`SUCCESS`'d
+   disbursement that turns out to be wrong: `WalletService.
+   reverse_disbursement` (`total_disbursed -> available`, a
    `DISBURSEMENT_REVERSAL` entry) and the withdrawal moves to `REVERSED`.
 
-### `SelcomDisbursementService` (`app/integrations/selcom/disbursement.py`)
+### Selcom Business API (`app/integrations/selcom_business/`)
 
-Mirrors `CollectionService`'s shape exactly —
-`initiate_disbursement()`/`query_disbursement()`/`verify_callback()`/
-`process_callback()` — and the same honesty rule: every path Selcom's
-official documentation would need to fill in is a `TODO(selcom-docs)` that
-raises `SelcomNotImplementedError` (distinct from `SelcomNotConfiguredError`,
-which just means credentials are unset). `process_callback` always saves
-the raw callback first, then verify -> look up the withdrawal by Selcom's
-own provider reference -> idempotency -> only then calls
-`PayoutService.apply_disbursement_result` — all real and tested by
-simulating a verified callback (`apps/api/tests/test_disbursement_webhook.py`),
-exactly like `test_selcom_webhook.py` does for collections.
+The real, RSA-SHA256-signed transport (developer.selcom.business) —
+distinct from `app/integrations/selcom/` (the older, still-unimplemented
+Collection API module, untouched). `client.py` implements all four
+documented endpoints (`account/lookup`, `transaction/process`,
+`transaction/query`, `balance`); `signing.py` builds the exact canonical
+string (`timestamp=<iso8601-ms>&field1=value1&...`, fields in
+`signed-fields` header order) and signs it with
+`cryptography`'s PKCS#1 v1.5; `schemas.py` holds the request/response
+shapes and `interpret_resultcode`; `errors.py` the exception hierarchy.
+`client.build_url` defensively strips a trailing `/v1` from the
+configured base URL before joining a path — the public docs display the
+production base AS `https://api.selcom.business/v1` while also
+documenting `/v1/...` paths, which would otherwise double up.
+
+**Callback is a signal, never authoritative** — the public docs describe
+no callback signature/authentication scheme. `POST
+/api/v1/webhooks/selcom-business/disbursement` only extracts
+`reference_id`, looks up the matching withdrawal, and calls
+`PayoutService.reconcile_withdrawal`, which re-verifies via an
+authenticated `GET /v1/transaction/query` before anything is ever
+finalized — the callback payload's own `status`/`amount` claims are never
+trusted directly. A periodic Celery Beat task
+(`app/tasks/reconciliation.py`, every 2 minutes, registered on `apps/api`'s
+own `celery_app` — it needs the API's DB/service layer, unlike
+`apps/worker`) sweeps every `PROCESSING`/`AMBIGUOUS` withdrawal the same
+way, as a safety net for a missed or never-sent callback.
+
+Run locally against the sandbox base URL first
+(`SELCOM_BUSINESS_ENVIRONMENT=sandbox`) — no production disbursement until
+signing, lookup, process, query, and callback/reconciliation are all
+verified working end to end.
 
 ### 2FA — an honest interim design
 

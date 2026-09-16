@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.api.v1.admin_diagnostics import router as admin_diagnostics_router
 from app.api.v1.admin_tenants import router as admin_tenants_router
+from app.api.v1.admin_withdrawals import router as admin_withdrawals_router
 from app.api.v1.audit import router as audit_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.customers import router as customers_router
@@ -48,6 +49,9 @@ api_router.include_router(audit_router, prefix="/audit", tags=["audit"])
 # Admin approval workflow that follows it (SUPER_ADMIN-only) -----------
 api_router.include_router(onboarding_router, prefix="/onboarding", tags=["onboarding"])
 api_router.include_router(admin_tenants_router, prefix="/admin/tenants", tags=["admin-tenants"])
+api_router.include_router(
+    admin_withdrawals_router, prefix="/admin/withdrawals", tags=["admin-withdrawals"]
+)
 api_router.include_router(
     admin_diagnostics_router, prefix="/admin/diagnostics", tags=["admin-diagnostics"]
 )

@@ -29,32 +29,56 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.enums import SettlementMode, WithdrawalStatus
+from app.core.enums import (
+    MOBILE_MONEY_DESTINATION_CODES,
+    DestinationCode,
+    SettlementMode,
+    WithdrawalStatus,
+)
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.money import DEFAULT_CURRENCY
 from app.core.pagination import ListParams
-from app.integrations.selcom.disbursement import SelcomDisbursementService
-from app.integrations.selcom.exceptions import SelcomNotConfiguredError, SelcomNotImplementedError
-from app.integrations.selcom.schemas import DisbursementOrderRequest
+from app.core.phone import normalize_tz_phone
+from app.integrations.resend.service import ResendEmailService
+from app.integrations.selcom_business.client import SelcomBusinessClient
+from app.integrations.selcom_business.config import selcom_business_config_from_settings
+from app.integrations.selcom_business.errors import (
+    SelcomBusinessAPIError,
+    SelcomBusinessError,
+    SelcomBusinessTransportError,
+    SelcomResultOutcome,
+)
+from app.integrations.selcom_business.schemas import interpret_resultcode, money_from_provider
 from app.models.finance import Withdrawal, WithdrawalDestination, WithdrawalEvent
 from app.repositories.finance import (
     WithdrawalDestinationRepository,
     WithdrawalEventRepository,
     WithdrawalRepository,
 )
+from app.repositories.onboarding import TenantFeatureFlagsRepository
+from app.repositories.tenancy import TenantRepository
+from app.schemas.finance import WithdrawalLookupPreviewResult
 from app.services.audit import write_audit_log
-from app.services.captive_portal import selcom_config_from_settings
 from app.services.settlement_config import SettlementConfigService
 from app.services.two_factor import TwoFactorService
 from app.services.wallet import WalletService
 
-# The maker (whoever requested a withdrawal) can never also be its checker
-# (whoever approves/rejects it) — enforced on every review action.
-_MAKER_CHECKER_VIOLATION = "The withdrawal requester cannot also review it (maker-checker)"
 
+def _mask_account(account_number: str | None) -> str | None:
+    """Keeps only the last 4 digits visible — e.g. "255712345678" ->
+    "********5678" — for anything shown outside the tenant's own
+    authenticated view (the Super Admin review email)."""
+    if not account_number:
+        return None
+    if len(account_number) <= 4:
+        return "*" * len(account_number)
+    return "*" * (len(account_number) - 4) + account_number[-4:]
+
+logger = structlog.get_logger("services.payouts")
 
 @dataclass(frozen=True)
 class TwoFactorConfirmationResult:
@@ -86,6 +110,19 @@ class PayoutService:
             raise NotFoundError("Withdrawal not found")
         return withdrawal
 
+    async def list_pending_super_admin_approval(self) -> list[Withdrawal]:
+        """Platform-wide — the Super Admin withdrawal queue's Pending
+        Approval tab. See app/api/v1/admin_withdrawals.py."""
+        return await self.repo.list_pending_super_admin_approval()
+
+    async def get_withdrawal_for_super_admin(self, *, withdrawal_id: UUID) -> Withdrawal:
+        """Tenant-agnostic lookup — a platform reviewer isn't scoped to
+        one tenant."""
+        withdrawal = await self.repo.get_by_id(tenant_id=None, id=withdrawal_id)
+        if withdrawal is None:
+            raise NotFoundError("Withdrawal not found")
+        return withdrawal
+
     async def list_events(
         self, *, tenant_id: UUID, withdrawal_id: UUID
     ) -> list[WithdrawalEvent]:
@@ -106,14 +143,30 @@ class PayoutService:
         actor_id: UUID,
         label: str,
         channel: str,
+        destination_code: DestinationCode,
         account_name: str | None,
         account_number: str | None,
         is_default: bool,
     ) -> WithdrawalDestination:
+        """`destination_code` is the one canonical source of which Selcom
+        FI a payout goes through (app.core.enums.DestinationCode) — never
+        a free-typed string. Mobile-money account numbers are normalized
+        to 255XXXXXXXXX here, once, so every later Selcom call and every
+        displayed value use the same canonical form; bank account numbers
+        are never touched."""
+        if destination_code in MOBILE_MONEY_DESTINATION_CODES:
+            if not account_number:
+                raise DomainValidationError("A mobile money destination requires a phone number")
+            try:
+                account_number = normalize_tz_phone(account_number)
+            except ValueError as exc:
+                raise DomainValidationError(str(exc)) from exc
+
         destination = await self.destination_repo.create(
             tenant_id=tenant_id,
             label=label,
             channel=channel,
+            destination_code=destination_code.value,
             account_name=account_name,
             account_number=account_number,
             is_default=is_default,
@@ -209,6 +262,16 @@ class PayoutService:
                 "business/legal approval and credentials."
             )
 
+        flags = await TenantFeatureFlagsRepository(self.db).get_by_tenant(tenant_id=tenant_id)
+        if flags is None or not flags.payout_enabled:
+            raise DomainValidationError(
+                "Payouts are not enabled for this tenant — a super admin must enable "
+                "the payout feature flag before withdrawals can be requested."
+            )
+
+        threshold = get_settings().selcom_withdrawal_approval_threshold_tzs
+        approval_required = amount > threshold
+
         try:
             wallet = await self.wallet_service.reserve_for_withdrawal(
                 tenant_id=tenant_id, amount=amount
@@ -227,6 +290,7 @@ class PayoutService:
             status=WithdrawalStatus.DRAFT.value,
             requested_by=actor_id,
             idempotency_key=uuid4().hex,
+            approval_required=approval_required,
         )
         await self.event_repo.create(
             tenant_id=tenant_id,
@@ -281,9 +345,20 @@ class PayoutService:
 
         verified = await self.two_factor.verify(withdrawal, code)
         if verified:
-            await self._transition(
-                withdrawal, to_status=WithdrawalStatus.PENDING_APPROVAL, actor_id=actor_id
-            )
+            if withdrawal.approval_required:
+                await self._transition(
+                    withdrawal, to_status=WithdrawalStatus.PENDING_APPROVAL, actor_id=actor_id
+                )
+                await self._send_super_admin_review_email(withdrawal)
+            else:
+                # At/under the threshold: no human approval step at all —
+                # straight to APPROVED and submit, exactly the same path
+                # a SUPER_ADMIN's approve_withdrawal takes for the
+                # over-threshold case.
+                await self._transition(
+                    withdrawal, to_status=WithdrawalStatus.APPROVED, actor_id=actor_id
+                )
+                await self._submit_to_selcom(withdrawal, actor_id=actor_id)
             return TwoFactorConfirmationResult(
                 withdrawal=withdrawal, verified=True, cancelled=False
             )
@@ -304,20 +379,25 @@ class PayoutService:
 
         return TwoFactorConfirmationResult(withdrawal=withdrawal, verified=False, cancelled=False)
 
-    # --------------------------------------------------------- maker-checker
+    # ------------------------------------------------------ SUPER_ADMIN review
 
     async def approve_withdrawal(
-        self, *, tenant_id: UUID, withdrawal_id: UUID, actor_id: UUID, notes: str | None = None
+        self, *, withdrawal_id: UUID, actor_id: UUID, notes: str | None = None
     ) -> Withdrawal:
-        withdrawal = await self.repo.get_by_id_for_update(tenant_id=tenant_id, id=withdrawal_id)
+        """SUPER_ADMIN only — enforced by the route dependency
+        (require_role(Role.SUPER_ADMIN)), never by this service checking
+        who requested it. Cross-tenant lookup: a platform reviewer isn't
+        scoped to one tenant. Only ever reachable for a withdrawal that
+        was itself flagged approval_required at request time — an
+        at/under-threshold withdrawal never enters PENDING_APPROVAL, so
+        there is nothing for this method to act on for it."""
+        withdrawal = await self.repo.get_by_id_for_update(tenant_id=None, id=withdrawal_id)
         if withdrawal is None:
             raise NotFoundError("Withdrawal not found")
         if withdrawal.status != WithdrawalStatus.PENDING_APPROVAL.value:
             raise DomainValidationError(
                 f"Withdrawal is not pending approval (status: {withdrawal.status})"
             )
-        if withdrawal.requested_by == actor_id:
-            raise DomainValidationError(_MAKER_CHECKER_VIOLATION)
 
         await self.repo.update(
             withdrawal, reviewed_by=actor_id, reviewed_at=datetime.now(UTC), review_notes=notes
@@ -330,23 +410,22 @@ class PayoutService:
         return withdrawal
 
     async def reject_withdrawal(
-        self, *, tenant_id: UUID, withdrawal_id: UUID, actor_id: UUID, reason: str
+        self, *, withdrawal_id: UUID, actor_id: UUID, reason: str
     ) -> Withdrawal:
+        """SUPER_ADMIN only — see approve_withdrawal's docstring."""
         if not reason or not reason.strip():
             raise DomainValidationError("A rejection requires a reason")
 
-        withdrawal = await self.repo.get_by_id_for_update(tenant_id=tenant_id, id=withdrawal_id)
+        withdrawal = await self.repo.get_by_id_for_update(tenant_id=None, id=withdrawal_id)
         if withdrawal is None:
             raise NotFoundError("Withdrawal not found")
         if withdrawal.status != WithdrawalStatus.PENDING_APPROVAL.value:
             raise DomainValidationError(
                 f"Withdrawal is not pending approval (status: {withdrawal.status})"
             )
-        if withdrawal.requested_by == actor_id:
-            raise DomainValidationError(_MAKER_CHECKER_VIOLATION)
 
         await self.wallet_service.release_reservation(
-            tenant_id=tenant_id, amount=Decimal(withdrawal.amount)
+            tenant_id=withdrawal.tenant_id, amount=Decimal(withdrawal.amount)
         )
         await self.repo.update(
             withdrawal,
@@ -417,17 +496,58 @@ class PayoutService:
         )
         return withdrawal
 
+    # -------------------------------------------------------- Selcom lookup
+
+    async def preview_lookup(
+        self, *, tenant_id: UUID, destination_id: UUID, amount: Decimal
+    ) -> WithdrawalLookupPreviewResult:
+        """Display-only — shown to the tenant before they confirm a
+        withdrawal. Never persists anything and is never what ends up
+        stored as verified_recipient_name; the actual submission
+        independently re-runs this same lookup server-side regardless
+        (see _submit_to_selcom), so a tenant can never bypass verification
+        by skipping this call or by tampering with its response."""
+        destination = await self.destination_repo.get_by_id(
+            tenant_id=tenant_id, id=destination_id
+        )
+        if destination is None:
+            raise DomainValidationError("destination_id does not belong to this tenant")
+        if not destination.destination_code or not destination.account_number:
+            raise DomainValidationError("This destination has no verified account to look up")
+
+        threshold = get_settings().selcom_withdrawal_approval_threshold_tzs
+        client = SelcomBusinessClient(selcom_business_config_from_settings())
+        try:
+            response = await client.account_lookup(
+                bank=destination.destination_code,
+                account=destination.account_number,
+                trans_id=f"lookup-{uuid4().hex}",
+                amount=amount,
+            )
+        except SelcomBusinessError as exc:
+            raise DomainValidationError(f"Could not verify destination account: {exc}") from exc
+
+        data = response.data
+        return WithdrawalLookupPreviewResult(
+            account_name=data.account_name if data else None,
+            operator=data.operator if data else None,
+            total_charges=money_from_provider(data.total_charges) if data else None,
+            approval_required=amount > threshold,
+        )
+
     # ------------------------------------------------------ Selcom submission
 
     async def _submit_to_selcom(self, withdrawal: Withdrawal, *, actor_id: UUID | None) -> None:
-        """Never re-entrant: only ever runs immediately after
-        approve_withdrawal transitions APPROVED, and the first thing it
-        does is move to PROCESSING — so even if this were somehow called
-        twice concurrently, the second caller's status check would see
-        PROCESSING (or later) and refuse to submit again. Combined with
-        the row lock held by approve_withdrawal's get_by_id_for_update
-        call, this is the "never retry payout submission blindly"
-        guarantee."""
+        """Never re-entrant: only ever runs immediately after 2FA
+        auto-approves an at/under-threshold withdrawal, or after a
+        SUPER_ADMIN approves an over-threshold one — and the first thing
+        it does (once past the account lookup) is move to PROCESSING, so
+        even if this were somehow called twice concurrently, the second
+        caller's status check would see PROCESSING (or later) and refuse
+        to submit again. Combined with the row lock held by the caller's
+        get_by_id_for_update call, this is the "never retry payout
+        submission blindly" guarantee — transaction_process is called at
+        most once per withdrawal, ever."""
         if withdrawal.status != WithdrawalStatus.APPROVED.value:
             return
 
@@ -440,35 +560,287 @@ class PayoutService:
             )
             return
 
+        destination = await self.destination_repo.get_by_id(
+            tenant_id=withdrawal.tenant_id, id=withdrawal.destination_id
+        )
+        if (
+            destination is None
+            or not destination.destination_code
+            or not destination.account_number
+        ):
+            await self._fail_withdrawal(
+                withdrawal,
+                reason="Withdrawal destination is missing or incomplete",
+                actor_id=actor_id,
+            )
+            return
+
+        client = SelcomBusinessClient(selcom_business_config_from_settings())
+
+        # Re-verify the destination immediately before transferring — the
+        # one and only source of verified_recipient_name. Never trust any
+        # name a client supplied earlier via preview_lookup.
+        try:
+            lookup = await client.account_lookup(
+                bank=destination.destination_code,
+                account=destination.account_number,
+                trans_id=f"{withdrawal.idempotency_key}-lookup",
+                amount=Decimal(withdrawal.amount),
+            )
+        except SelcomBusinessTransportError as exc:
+            # Unknown outcome, not a failure — never release funds or mark
+            # FAILED for a lookup we simply couldn't complete.
+            logger.warning(
+                "payouts.lookup_transport_error", withdrawal_id=str(withdrawal.id), error=str(exc)
+            )
+            return
+        except SelcomBusinessError as exc:
+            await self._fail_withdrawal(withdrawal, reason=str(exc), actor_id=actor_id)
+            return
+
+        verified_name = lookup.data.account_name if lookup.data else None
+        if not verified_name:
+            await self._fail_withdrawal(
+                withdrawal,
+                reason="Selcom could not verify a recipient name for this destination",
+                actor_id=actor_id,
+            )
+            return
+
+        provider_charge = money_from_provider(lookup.data.total_charges) if lookup.data else None
+        await self.repo.update(
+            withdrawal, verified_recipient_name=verified_name, provider_charge=provider_charge
+        )
+        withdrawal.verified_recipient_name = verified_name
+
         await self._transition(
             withdrawal, to_status=WithdrawalStatus.PROCESSING, actor_id=actor_id
         )
         await self.repo.update(withdrawal, submitted_at=datetime.now(UTC))
 
-        destination = await self.destination_repo.get_by_id(
-            tenant_id=withdrawal.tenant_id, id=withdrawal.destination_id
-        )
-
-        service = SelcomDisbursementService(selcom_config_from_settings())
         try:
-            response = await service.initiate_disbursement(
-                DisbursementOrderRequest(
-                    reference=withdrawal.idempotency_key,
-                    amount=Decimal(withdrawal.amount),
-                    currency=withdrawal.currency,
-                    recipient_phone=(destination.account_number if destination else None) or "",
-                    recipient_name=destination.account_name if destination else None,
-                )
+            process_response = await client.transaction_process(
+                trans_id=withdrawal.idempotency_key,
+                recipient_fi_code=destination.destination_code,
+                recipient_account=destination.account_number,
+                recipient_name=verified_name,
+                amount=Decimal(withdrawal.amount),
+                purpose="FT",
+                remarks=f"Infinity Radius withdrawal {withdrawal.idempotency_key}",
             )
-        except (SelcomNotConfiguredError, SelcomNotImplementedError) as exc:
+        except SelcomBusinessTransportError as exc:
+            # HTTP timeout/connection failure at the exact moment of
+            # submission — the one truly dangerous case: Selcom may or may
+            # not have received it. NEVER resubmit. Query with the SAME
+            # transId to find out, and apply whatever that reveals.
+            logger.warning(
+                "payouts.process_transport_error", withdrawal_id=str(withdrawal.id), error=str(exc)
+            )
+            await self._reconcile_locked(withdrawal, actor_id=actor_id)
+            return
+        except SelcomBusinessAPIError as exc:
             await self._fail_withdrawal(withdrawal, reason=str(exc), actor_id=actor_id)
             return
 
-        if response.provider_reference:
-            await self.repo.update(withdrawal, provider_reference=response.provider_reference)
-        # Stays PROCESSING — apply_disbursement_result (via the Selcom
-        # disbursement webhook, or a future query_disbursement poll)
-        # resolves it to SUCCESS/FAILED. Never presumed here.
+        await self.repo.update(
+            withdrawal,
+            provider_reference=withdrawal.idempotency_key,
+            provider_result_code=process_response.resultcode,
+            provider_message=process_response.message,
+        )
+        await self._apply_provider_result(
+            withdrawal,
+            resultcode=process_response.resultcode,
+            message=process_response.message,
+            provider_amount=(
+                money_from_provider(process_response.data.amount) if process_response.data else None
+            ),
+            provider_reference=(
+                process_response.data.selcom_receipt if process_response.data else None
+            )
+            or withdrawal.idempotency_key,
+            actor_id=actor_id,
+        )
+
+    async def _apply_provider_result(
+        self,
+        withdrawal: Withdrawal,
+        *,
+        resultcode: str | None,
+        message: str | None,
+        provider_amount: Decimal | None,
+        provider_reference: str,
+        actor_id: UUID | None,
+    ) -> None:
+        """The one place a Selcom result (from a direct process/query
+        response, a reconciliation query, or a callback-triggered query)
+        is turned into a withdrawal state change. Never called with an
+        unauthenticated callback payload's own claims — always with a
+        result this process obtained directly from an RSA-signed request."""
+        if withdrawal.status not in (
+            WithdrawalStatus.PROCESSING.value,
+            WithdrawalStatus.AMBIGUOUS.value,
+        ):
+            return  # already resolved — idempotent no-op
+
+        parsed = interpret_resultcode(resultcode=resultcode, message=message)
+
+        if parsed.outcome == SelcomResultOutcome.SUCCESS:
+            if provider_amount is not None and provider_amount != Decimal(withdrawal.amount):
+                # Amount mismatch is exactly the spoofed/corrupted-signal
+                # case this integration must never finalize on trust —
+                # flag for manual review instead of either finalizing or
+                # silently discarding it.
+                await self.repo.update(
+                    withdrawal,
+                    provider_result_code=parsed.resultcode,
+                    provider_message=f"Amount mismatch: provider reported {provider_amount}",
+                )
+                await self._transition(
+                    withdrawal,
+                    to_status=WithdrawalStatus.AMBIGUOUS,
+                    actor_id=actor_id,
+                    reason="Provider-reported amount does not match the withdrawal amount",
+                )
+                return
+
+            await self.wallet_service.complete_disbursement(
+                tenant_id=withdrawal.tenant_id,
+                amount=Decimal(withdrawal.amount),
+                reference_id=withdrawal.id,
+                description=f"Selcom disbursement {provider_reference}",
+            )
+            await self.repo.update(
+                withdrawal,
+                provider_reference=provider_reference,
+                provider_result_code=parsed.resultcode,
+                provider_message=message,
+                completed_at=datetime.now(UTC),
+            )
+            await self._transition(
+                withdrawal, to_status=WithdrawalStatus.SUCCESS, actor_id=actor_id, reason=message
+            )
+        elif parsed.outcome == SelcomResultOutcome.INPROGRESS:
+            # Stays PROCESSING — funds stay reserved, nothing finalized.
+            # Reconciliation (Celery beat or a later callback) resolves it.
+            await self.repo.update(
+                withdrawal, provider_result_code=parsed.resultcode, provider_message=message
+            )
+        elif parsed.outcome == SelcomResultOutcome.AMBIGUOUS:
+            # Never retried. Funds stay reserved until reconciliation
+            # resolves it or a SUPER_ADMIN reviews it operationally.
+            await self.repo.update(
+                withdrawal, provider_result_code=parsed.resultcode, provider_message=message
+            )
+            await self._transition(
+                withdrawal,
+                to_status=WithdrawalStatus.AMBIGUOUS,
+                actor_id=actor_id,
+                reason=message or "Selcom resultcode 999 — status unknown, never retried",
+            )
+        else:
+            await self.repo.update(
+                withdrawal, provider_result_code=parsed.resultcode, provider_message=message
+            )
+            await self._fail_withdrawal(
+                withdrawal,
+                reason=message or f"Selcom reported failure (resultcode {parsed.resultcode})",
+                actor_id=actor_id,
+            )
+
+    async def _reconcile_locked(self, withdrawal: Withdrawal, *, actor_id: UUID | None) -> None:
+        """Queries Selcom with the withdrawal's own idempotency_key as
+        transId — the only safe way to resolve a submission whose HTTP
+        response was never received (timeout/connection error). Assumes
+        the caller already holds this withdrawal's row lock."""
+        client = SelcomBusinessClient(selcom_business_config_from_settings())
+        try:
+            query = await client.transaction_query(trans_id=withdrawal.idempotency_key)
+        except SelcomBusinessTransportError:
+            # Still unknown — leave it PROCESSING; a later reconciliation
+            # pass (Celery beat) will try again. Never guess, never retry
+            # the transfer itself.
+            return
+        except SelcomBusinessError as exc:
+            logger.warning(
+                "payouts.reconcile_query_error", withdrawal_id=str(withdrawal.id), error=str(exc)
+            )
+            return
+
+        data = query.data
+        status = (data.status if data else None) or ""
+        resultcode = query.resultcode or {
+            "COMPLETED": "000",
+            "ACCEPTED": "111",
+            "FAILED": "900",
+        }.get(status, query.resultcode)
+        await self._apply_provider_result(
+            withdrawal,
+            resultcode=resultcode,
+            message=query.message,
+            provider_amount=money_from_provider(data.amount) if data else None,
+            provider_reference=(data.selcom_receipt if data else None)
+            or withdrawal.idempotency_key,
+            actor_id=actor_id,
+        )
+
+    async def reconcile_withdrawal(self, *, withdrawal_id: UUID) -> Withdrawal:
+        """Public entry point for both the Selcom disbursement callback
+        (see app/api/v1/webhooks.py) and the periodic Celery beat sweep
+        (see app/core/celery_app.py) — a callback is only ever treated as
+        a signal to query, never trusted to move money on its own claims."""
+        withdrawal = await self.repo.get_by_id_for_update(tenant_id=None, id=withdrawal_id)
+        if withdrawal is None:
+            raise NotFoundError("Withdrawal not found")
+        await self._reconcile_locked(withdrawal, actor_id=None)
+        return withdrawal
+
+    async def list_reconcilable_withdrawals(self) -> list[Withdrawal]:
+        """Every withdrawal a periodic reconciliation sweep should query —
+        PROCESSING (awaiting a first authoritative result) or AMBIGUOUS
+        (resultcode 999, never retried, only ever resolved by query)."""
+        return await self.repo.list_by_statuses(
+            statuses=[WithdrawalStatus.PROCESSING.value, WithdrawalStatus.AMBIGUOUS.value]
+        )
+
+    async def _send_super_admin_review_email(self, withdrawal: Withdrawal) -> None:
+        settings = get_settings()
+        if not settings.super_admin_review_email:
+            logger.info(
+                "payouts.super_admin_review_email_skipped",
+                reason="SUPER_ADMIN_REVIEW_EMAIL not configured",
+                withdrawal_id=str(withdrawal.id),
+            )
+            return
+
+        tenant = await TenantRepository(self.db).get_by_id(tenant_id=None, id=withdrawal.tenant_id)
+        destination = await self.destination_repo.get_by_id(
+            tenant_id=withdrawal.tenant_id, id=withdrawal.destination_id
+        )
+        result = await ResendEmailService().send_admin_withdrawal_review_email(
+            tenant_name=tenant.name if tenant else str(withdrawal.tenant_id),
+            amount=Decimal(withdrawal.amount),
+            currency=withdrawal.currency,
+            destination_channel=destination.channel if destination else "unknown",
+            destination_code=destination.destination_code if destination else None,
+            masked_account=_mask_account(destination.account_number if destination else None),
+            withdrawal_reference=withdrawal.idempotency_key,
+            requested_at=withdrawal.created_at,
+            withdrawal_id=withdrawal.id,
+        )
+        action = (
+            "withdrawal.super_admin_email_sent"
+            if result.sent
+            else "withdrawal.super_admin_email_failed"
+        )
+        await write_audit_log(
+            self.db,
+            tenant_id=withdrawal.tenant_id,
+            actor_id=None,
+            action=action,
+            target_type="withdrawal",
+            target_id=withdrawal.id,
+        )
 
     async def apply_disbursement_result(
         self,

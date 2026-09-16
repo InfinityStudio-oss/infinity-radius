@@ -118,18 +118,25 @@ def test_dashboard_summary_reflects_real_cross_tenant_rows() -> None:
         ctx_a.new_commercial_terms(tenant_id=tenant_a, commission_rate_percent="10.00")
         asyncio.run(_process_collection(tenant_a, "1000.00"))
 
-        # A real pending payout: request + confirm 2FA -> PENDING_APPROVAL.
+        # A real pending payout: request (over the SUPER_ADMIN approval
+        # threshold) + confirm 2FA -> PENDING_APPROVAL.
         ctx_a.new_settlement_config(tenant_id=tenant_a)
-        asyncio.run(_credit_available(tenant_a, admin_id, "500.00"))
+        ctx_a.new_tenant_feature_flags(tenant_id=tenant_a, payout_enabled=True)
+        asyncio.run(_credit_available(tenant_a, admin_id, "200000.00"))
         destination_id = client.post(
             "/api/v1/payouts/destinations",
             headers=auth_header(user_id=owner_a),
-            json={"label": "M-Pesa", "channel": "mobile_money", "account_number": "255700000001"},
+            json={
+                "label": "M-Pesa",
+                "channel": "mobile_money",
+                "destination_code": "MPESA",
+                "account_number": "255700000001",
+            },
         ).json()["data"]["id"]
         request_response = client.post(
             "/api/v1/payouts",
             headers=auth_header(user_id=owner_a),
-            json={"destination_id": destination_id, "amount": "300.00"},
+            json={"destination_id": destination_id, "amount": "150000.00"},
         )
         withdrawal_id = request_response.json()["withdrawal"]["id"]
         code = request_response.json()["two_factor_code"]
@@ -162,14 +169,14 @@ def test_dashboard_summary_reflects_real_cross_tenant_rows() -> None:
     assert data["radius_active_sessions"] >= 1
     assert Decimal(data["collections_today_tzs"]) >= Decimal("1000.00")
     assert data["pending_payouts"] >= 1
-    assert Decimal(data["pending_payouts_amount_tzs"]) >= Decimal("300.00")
+    assert Decimal(data["pending_payouts_amount_tzs"]) >= Decimal("150000.00")
     assert data["failed_webhooks"] >= 1
 
     pending_rows = pending_response.json()["data"]
     assert any(row["withdrawal_id"] == withdrawal_id for row in pending_rows)
     matching = next(row for row in pending_rows if row["withdrawal_id"] == withdrawal_id)
     assert matching["status"] == "PENDING_APPROVAL"
-    assert Decimal(matching["amount_tzs"]) == Decimal("300.00")
+    assert Decimal(matching["amount_tzs"]) == Decimal("150000.00")
 
 
 def test_collections_trend_is_empty_when_nothing_collected_anywhere() -> None:

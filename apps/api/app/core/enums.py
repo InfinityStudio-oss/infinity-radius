@@ -95,12 +95,19 @@ class SettlementMode(StrEnum):
 class WithdrawalStatus(StrEnum):
     """A withdrawal's lifecycle — see app/services/payouts.py for exactly
     which methods cause which transition, and withdrawal_events for the
-    full transition history of any one row."""
+    full transition history of any one row.
+
+    PENDING_APPROVAL now means "awaiting SUPER_ADMIN review" (amount over
+    the configurable threshold), never tenant-side maker-checker — see
+    docs/architecture.md#selcom-business-disbursement for why that changed.
+    A withdrawal at or under the threshold skips PENDING_APPROVAL entirely
+    (DRAFT -> APPROVED the moment 2FA confirms)."""
 
     DRAFT = "DRAFT"  # created, balance reserved, awaiting 2FA confirmation
-    PENDING_APPROVAL = "PENDING_APPROVAL"  # 2FA confirmed, awaiting maker-checker approval
-    APPROVED = "APPROVED"  # approved, about to be (or being) submitted to Selcom
+    PENDING_APPROVAL = "PENDING_APPROVAL"  # 2FA confirmed, over threshold, awaiting SUPER_ADMIN
+    APPROVED = "APPROVED"  # approved (or auto-approved, at/under threshold) — about to submit
     PROCESSING = "PROCESSING"  # submitted to Selcom, awaiting its authoritative result
+    AMBIGUOUS = "AMBIGUOUS"  # Selcom resultcode 999 — never retried; resolved only by query
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"  # Selcom reported failure, or submission itself couldn't happen
     REJECTED = "REJECTED"  # a checker rejected it before submission
@@ -116,6 +123,73 @@ WITHDRAWAL_TERMINAL_STATUSES = frozenset(
         WithdrawalStatus.REJECTED,
         WithdrawalStatus.CANCELLED,
         WithdrawalStatus.REVERSED,
+    }
+)
+
+
+class DestinationCode(StrEnum):
+    """Selcom Business's own FI/destination codes (developer.selcom.business
+    account/lookup + transaction/process — recipientFiCode). The one
+    canonical source for a withdrawal destination's operator/bank — never
+    invent a code that isn't listed here. `category` (below) is derived
+    from membership in the two frozensets, not a separate stored field."""
+
+    # Selcom Pesa / Selcom account itself.
+    SELCOM = "SELCOM"
+    # Mobile money operators.
+    AIRTELMONEY = "AIRTELMONEY"
+    HALOPESA = "HALOPESA"
+    MIXXBYYAS = "MIXXBYYAS"
+    TTCLPESA = "TTCLPESA"
+    MPESA = "MPESA"
+    # Banks.
+    ABSA = "ABSA"
+    BANCABC = "BANCABC"
+    ACB = "ACB"
+    AMANA = "AMANA"
+    AZANIA = "AZANIA"
+    BOA = "BOA"
+    BOBTZ = "BOBTZ"
+    BOI = "BOI"
+    BOT = "BOT"
+    CANARA = "CANARA"
+    CITI = "CITI"
+    CRDB = "CRDB"
+    DCB = "DCB"
+    DTB = "DTB"
+    ECOBANK = "ECOBANK"
+    EQUITY = "EQUITY"
+    EXIM = "EXIM"
+    FINCA = "FINCA"
+    GTBANK = "GTBANK"
+    HABIB = "HABIB"
+    IMBANK = "IMBANK"
+    ICB = "ICB"
+    KCB = "KCB"
+    LETSHEGO = "LETSHEGO"
+    MAENDELEO = "MAENDELEO"
+    MKOMBOZI = "MKOMBOZI"
+    MUCOBA = "MUCOBA"
+    MWALIMU = "MWALIMU"
+    MWANGA = "MWANGA"
+    NBC = "NBC"
+    NCBA = "NCBA"
+    NMB = "NMB"
+    PBZ = "PBZ"
+    STANBIC = "STANBIC"
+    SCB = "SCB"
+    TCB = "TCB"
+    UCHUMI = "UCHUMI"
+    UBA = "UBA"
+
+
+MOBILE_MONEY_DESTINATION_CODES = frozenset(
+    {
+        DestinationCode.AIRTELMONEY,
+        DestinationCode.HALOPESA,
+        DestinationCode.MIXXBYYAS,
+        DestinationCode.TTCLPESA,
+        DestinationCode.MPESA,
     }
 )
 

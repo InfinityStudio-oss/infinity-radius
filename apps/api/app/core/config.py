@@ -4,6 +4,7 @@ Pydantic Settings fails fast at process startup if a required variable is
 missing or malformed, rather than surfacing as an obscure error mid-request.
 """
 
+from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated, Literal
 
@@ -117,6 +118,38 @@ class Settings(BaseSettings):
     # approval for the disbursement model and flips this on. Defaults to
     # off — see app/services/payouts.py and docs/architecture.md.
     selcom_disbursement_enabled: bool = False
+
+    # --- Selcom Business API (real disbursement transport) ---
+    # developer.selcom.business — RSA-SHA256 signed, distinct from the
+    # older selcom_api_key/selcom_api_secret HMAC-style config above (which
+    # remains for the still-unimplemented Collection API only). See
+    # app/integrations/selcom_business/. "sandbox" or "production" —
+    # sandbox until real credentials/access are confirmed working end to
+    # end (account lookup, transaction process, transaction query,
+    # callback/reconciliation) — never production by accident.
+    selcom_business_environment: Literal["sandbox", "production"] = "sandbox"
+    # Origin only, e.g. "https://sandbox.selcom.business" or
+    # "https://api.selcom.business" — never include a trailing "/v1": the
+    # client always appends the full "/v1/..." path itself, and defensively
+    # strips one if present (the public docs display the production base
+    # AS "https://api.selcom.business/v1", which would double up otherwise
+    # — see app/integrations/selcom_business/client.py).
+    selcom_business_base_url: str | None = None
+    selcom_business_api_key: str | None = None
+    # PEM-encoded RSA private key, base64-encoded once more so a multiline
+    # PEM block survives being pasted into a single-line env var. Decode
+    # with base64.b64decode(...).decode() to recover the real PEM. Never
+    # logged, never returned in any API response, never sent to Vercel.
+    selcom_business_private_key_b64: str | None = None
+    # Only needed if the Balance endpoint is used (Super Admin provider-
+    # health visibility) — never the tenant wallet balance.
+    selcom_business_account_number: str | None = None
+
+    # --- Withdrawal approval threshold (see app/services/payouts.py) ---
+    # amount <= this: no Super Admin approval, proceeds straight to Selcom
+    # once 2FA confirms. amount > this: PENDING_APPROVAL until a SUPER_ADMIN
+    # approves or rejects it. Server-side only — never a frontend control.
+    selcom_withdrawal_approval_threshold_tzs: Decimal = Decimal("100000")
 
     @field_validator("cors_allow_origins", mode="before")
     @classmethod

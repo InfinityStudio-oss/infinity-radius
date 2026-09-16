@@ -1,7 +1,12 @@
-"""Tenant payouts — thin route handlers, logic in PayoutService. The full
-maker-checker lifecycle: TENANT_OWNER requests + confirms 2FA + can cancel
-their own request; TENANT_OWNER/TENANT_ADMIN approve or reject (never the
-same person who requested it — enforced in the service layer)."""
+"""Tenant payouts — thin route handlers, logic in PayoutService.
+
+Lifecycle: TENANT_OWNER requests + confirms 2FA + can cancel their own
+request. Approval is no longer a tenant-side action at all — amounts at
+or under Settings.selcom_withdrawal_approval_threshold_tzs proceed
+straight to Selcom once 2FA confirms; amounts over it wait for a
+SUPER_ADMIN (see app/api/v1/admin_withdrawals.py), never another tenant
+user. See app/services/payouts.py and docs/architecture.md.
+"""
 
 from uuid import UUID
 
@@ -15,14 +20,14 @@ from app.core.roles import FINANCE_ROLES, MANAGEMENT_ROLES, Role
 from app.db.session import get_db
 from app.schemas.envelope import ApiListResponse, ApiResponse, PaginationMeta
 from app.schemas.finance import (
-    WithdrawalApprovalRequest,
     WithdrawalCancellationRequest,
     WithdrawalCreate,
     WithdrawalDestinationCreate,
     WithdrawalDestinationRead,
     WithdrawalEventRead,
+    WithdrawalLookupPreviewRequest,
+    WithdrawalLookupPreviewResult,
     WithdrawalRead,
-    WithdrawalRejectionRequest,
     WithdrawalRequestResult,
     WithdrawalTwoFactorConfirm,
 )
@@ -31,7 +36,6 @@ from app.services.payouts import PayoutService
 router = APIRouter()
 
 require_requester = require_tenant_role(Role.TENANT_OWNER)
-require_checker = require_tenant_role(*MANAGEMENT_ROLES)
 
 
 @router.get("", response_model=ApiListResponse[WithdrawalRead])
@@ -102,12 +106,29 @@ async def create_payout_destination(
         actor_id=ctx.user.id,
         label=payload.label,
         channel=payload.channel,
+        destination_code=payload.destination_code,
         account_name=payload.account_name,
         account_number=payload.account_number,
         is_default=payload.is_default,
     )
     await db.commit()
     return ApiResponse(data=WithdrawalDestinationRead.model_validate(destination))
+
+
+@router.post("/lookup", response_model=ApiResponse[WithdrawalLookupPreviewResult])
+async def preview_payout_lookup(
+    payload: WithdrawalLookupPreviewRequest,
+    ctx: TenantContext = Depends(require_tenant_role(*FINANCE_ROLES)),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[WithdrawalLookupPreviewResult]:
+    """Read-only preview shown before the tenant confirms a withdrawal —
+    never persists anything. The actual submission independently re-runs
+    this same lookup server-side; this is display-only."""
+    service = PayoutService(db)
+    result = await service.preview_lookup(
+        tenant_id=ctx.tenant_id, destination_id=payload.destination_id, amount=payload.amount
+    )
+    return ApiResponse(data=result)
 
 
 @router.get("/{withdrawal_id}", response_model=ApiResponse[WithdrawalRead])
@@ -167,42 +188,6 @@ async def confirm_payout_two_factor(
         remaining = 5 - result.withdrawal.two_factor_attempts
         raise DomainValidationError(f"Invalid 2FA code — {remaining} attempt(s) remaining")
     return ApiResponse(data=WithdrawalRead.model_validate(result.withdrawal))
-
-
-@router.post("/{withdrawal_id}/approve", response_model=ApiResponse[WithdrawalRead])
-async def approve_payout(
-    withdrawal_id: UUID,
-    payload: WithdrawalApprovalRequest,
-    ctx: TenantContext = Depends(require_checker),
-    db: AsyncSession = Depends(get_db),
-) -> ApiResponse[WithdrawalRead]:
-    service = PayoutService(db)
-    withdrawal = await service.approve_withdrawal(
-        tenant_id=ctx.tenant_id,
-        withdrawal_id=withdrawal_id,
-        actor_id=ctx.user.id,
-        notes=payload.notes,
-    )
-    await db.commit()
-    return ApiResponse(data=WithdrawalRead.model_validate(withdrawal))
-
-
-@router.post("/{withdrawal_id}/reject", response_model=ApiResponse[WithdrawalRead])
-async def reject_payout(
-    withdrawal_id: UUID,
-    payload: WithdrawalRejectionRequest,
-    ctx: TenantContext = Depends(require_checker),
-    db: AsyncSession = Depends(get_db),
-) -> ApiResponse[WithdrawalRead]:
-    service = PayoutService(db)
-    withdrawal = await service.reject_withdrawal(
-        tenant_id=ctx.tenant_id,
-        withdrawal_id=withdrawal_id,
-        actor_id=ctx.user.id,
-        reason=payload.reason,
-    )
-    await db.commit()
-    return ApiResponse(data=WithdrawalRead.model_validate(withdrawal))
 
 
 @router.post("/{withdrawal_id}/cancel", response_model=ApiResponse[WithdrawalRead])

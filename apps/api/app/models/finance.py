@@ -210,6 +210,11 @@ class WithdrawalDestination(UUIDPrimaryKeyMixin, Base):
     label: Mapped[str] = mapped_column(Text, nullable=False)
     # mobile_money | bank
     channel: Mapped[str] = mapped_column(Text, nullable=False)
+    # The specific Selcom FI code this destination pays out through — see
+    # app.core.enums.DestinationCode. Nullable only for rows created before
+    # this column existed; every new destination must set it (enforced in
+    # PayoutService.create_destination, not just the DB CHECK constraint).
+    destination_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_number: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
@@ -256,6 +261,25 @@ class Withdrawal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Persisted once at request time — whether this withdrawal ever needed
+    # SUPER_ADMIN approval, per Settings.selcom_withdrawal_approval_threshold_tzs
+    # AT THE TIME it was requested. Deliberately not re-derived from amount
+    # later: if the threshold setting changes, past withdrawals' recorded
+    # approval requirement must stay exactly what it was.
+    approval_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    # The Selcom account/lookup-confirmed name actually used for transfer —
+    # never a client-supplied override (see app/services/payouts.py).
+    verified_recipient_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Selcom's own quoted/charged fee for this transfer (account/lookup's
+    # totalCharges, or transaction/query's charges once available) — stored
+    # for reconciliation, never silently debited from the tenant wallet
+    # (no platform fee policy exists yet for withdrawal charges).
+    provider_charge: Mapped[str | None] = mapped_column(Numeric(14, 2), nullable=True)
+    provider_result_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     requested_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True

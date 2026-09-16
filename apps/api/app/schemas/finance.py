@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.core.enums import LedgerDirection, SettlementMode, WalletBucket
+from app.core.enums import DestinationCode, LedgerDirection, SettlementMode, WalletBucket
 from app.core.money import Money
 
 
@@ -67,6 +67,7 @@ class WithdrawalDestinationRead(BaseModel):
     tenant_id: UUID
     label: str
     channel: str
+    destination_code: str | None
     account_name: str | None
     account_number: str | None
     is_default: bool
@@ -76,6 +77,7 @@ class WithdrawalDestinationRead(BaseModel):
 class WithdrawalDestinationCreate(BaseModel):
     label: str
     channel: str
+    destination_code: DestinationCode
     account_name: str | None = None
     account_number: str | None = None
     is_default: bool = False
@@ -98,6 +100,11 @@ class WithdrawalRead(BaseModel):
     status: str
     provider_reference: str | None
     failure_reason: str | None
+    approval_required: bool
+    verified_recipient_name: str | None
+    provider_charge: Money | None
+    provider_result_code: str | None
+    provider_message: str | None
     requested_by: UUID | None
     reviewed_by: UUID | None
     reviewed_at: datetime | None
@@ -111,6 +118,24 @@ class WithdrawalRead(BaseModel):
 class WithdrawalCreate(BaseModel):
     destination_id: UUID
     amount: Money = Field(description="Amount to withdraw, as a decimal string, e.g. \"15000.00\"")
+
+
+class WithdrawalLookupPreviewRequest(BaseModel):
+    """A read-only, non-persisting Selcom account/lookup preview — shown to
+    the tenant before they confirm a withdrawal. The eventual withdrawal
+    submission independently re-runs this same lookup server-side
+    immediately before transferring; this preview never itself authorizes
+    anything and is never what gets stored as verified_recipient_name."""
+
+    destination_id: UUID
+    amount: Money
+
+
+class WithdrawalLookupPreviewResult(BaseModel):
+    account_name: str | None
+    operator: str | None
+    total_charges: Money | None
+    approval_required: bool
 
 
 class WithdrawalRequestResult(BaseModel):
