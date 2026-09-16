@@ -9,6 +9,7 @@ base URL is configured.
 import pytest
 
 from app.integrations.selcom_business.client import build_url
+from app.integrations.selcom_business.schemas import AccountLookupResponse, BalanceResponse
 
 
 @pytest.mark.parametrize(
@@ -50,3 +51,17 @@ def test_build_url_every_documented_endpoint() -> None:
 def test_build_url_rejects_a_path_missing_the_v1_prefix() -> None:
     with pytest.raises(ValueError, match="must start with '/v1/'"):
         build_url("https://api.selcom.business", "/transaction/process")
+
+
+def test_account_lookup_response_treats_empty_list_data_as_no_data() -> None:
+    """Observed directly against the real Selcom sandbox: `"data": []`
+    (an empty array, not null/{}) when a lookup has nothing to report."""
+    response = AccountLookupResponse.model_validate(
+        {"success": False, "resultcode": "900", "message": "Not found", "data": []}
+    )
+    assert response.data is None
+
+
+def test_balance_response_treats_empty_list_data_as_no_data() -> None:
+    response = BalanceResponse.model_validate({"success": False, "data": []})
+    assert response.data is None

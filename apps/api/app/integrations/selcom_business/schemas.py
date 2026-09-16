@@ -7,9 +7,19 @@ left as float past this module.
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.integrations.selcom_business.errors import SelcomResultCode, SelcomResultOutcome
+
+
+def _empty_list_to_none(value: Any) -> Any:
+    """Selcom's sandbox returns `"data": []` (an empty array, not `null` or
+    `{}`) when a lookup/query has nothing to report — observed directly
+    against the real sandbox, not assumed. Every Response.data field below
+    treats that the same as "no data", never a schema validation failure."""
+    if isinstance(value, list) and not value:
+        return None
+    return value
 
 # --- Account Lookup (GET /v1/account/lookup) -------------------------------
 
@@ -42,6 +52,8 @@ class AccountLookupResponse(BaseModel):
     data: AccountLookupData | None = None
 
     model_config = {"populate_by_name": True}
+
+    _normalize_data = field_validator("data", mode="before")(_empty_list_to_none)
 
 
 # --- Transaction Process (POST /v1/transaction/process) --------------------
@@ -78,6 +90,8 @@ class TransactionProcessResponse(BaseModel):
 
     model_config = {"populate_by_name": True}
 
+    _normalize_data = field_validator("data", mode="before")(_empty_list_to_none)
+
 
 # --- Transaction Query (GET /v1/transaction/query) --------------------------
 
@@ -104,6 +118,8 @@ class TransactionQueryResponse(BaseModel):
 
     model_config = {"populate_by_name": True}
 
+    _normalize_data = field_validator("data", mode="before")(_empty_list_to_none)
+
 
 # --- Balance (POST /v1/balance) --------------------------------------------
 
@@ -121,6 +137,8 @@ class BalanceResponse(BaseModel):
     resultcode: str | None = None
     message: str | None = None
     data: BalanceData | None = None
+
+    _normalize_data = field_validator("data", mode="before")(_empty_list_to_none)
 
 
 # --- Disbursement callback (POST our /webhooks/selcom-business/disbursement)
