@@ -79,7 +79,7 @@ def withdrawal_otp_email(
 <strong style="color:#151b2b;">{_esc(masked_destination)}</strong> with the code below.</p>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;">
   <tr>
-    <td align="center" style="background:linear-gradient(160deg,#151b2b,#1c2740);border-radius:16px;padding:28px 16px;">
+    <td align="center" bgcolor="#151b2b" style="background-color:#151b2b;border-radius:16px;padding:28px 16px;">
       <span style="display:inline-block;font-family:'SF Mono',Consolas,Menlo,monospace;font-size:36px;font-weight:700;letter-spacing:10px;color:#ffffff;">{_esc(otp_display)}</span>
       <div style="margin-top:12px;font-size:12px;color:#22d3ee;font-weight:700;letter-spacing:0.05em;">EXPIRES IN {minutes} MINUTE{"S" if minutes != 1 else ""} &middot; SINGLE USE</div>
     </td>

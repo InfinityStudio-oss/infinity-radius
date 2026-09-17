@@ -27,7 +27,7 @@ def render_email(*, app_url: str, preheader: str, body_html: str) -> str:
         <td align="center">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background-color:#ffffff;border-radius:20px;overflow:hidden;box-shadow:0 1px 3px rgba(15,23,42,0.06),0 8px 24px rgba(15,23,42,0.08);">
             <tr>
-              <td style="height:5px;line-height:5px;font-size:0;background:linear-gradient(90deg,#151b2b,#0891b2,#22d3ee);">&nbsp;</td>
+              <td bgcolor="#0891b2" style="height:5px;line-height:5px;font-size:0;background-color:#0891b2;">&nbsp;</td>
             </tr>
             <tr>
               <td style="padding:32px 32px 8px 32px;">
