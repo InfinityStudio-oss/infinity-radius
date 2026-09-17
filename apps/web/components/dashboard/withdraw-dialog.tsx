@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { apiMutate, ApiClientError } from "@/lib/api-client";
 import { useAccessToken } from "@/lib/hooks/use-access-token";
 
@@ -47,7 +47,15 @@ interface LookupResult {
 
 interface WithdrawalResult {
   withdrawal: { id: string; status: string; approval_required: boolean };
-  two_factor_code: string;
+  otp_sent: boolean;
+  masked_email: string;
+  expires_in_seconds: number;
+}
+
+interface OtpResendResult {
+  otp_sent: boolean;
+  masked_email: string;
+  expires_in_seconds: number;
 }
 
 type Step = "destination" | "new-destination" | "amount" | "review" | "two-factor" | "done";
@@ -82,6 +90,32 @@ export function WithdrawDialog({
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const cooldownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Purely a UX countdown — the server is the real authority on the
+  // cooldown (see POST /payouts/{id}/resend-otp, WITHDRAWAL_OTP_RESEND_
+  // COOLDOWN_SECONDS). If it ever desyncs, a 429's message is parsed back
+  // into this same counter (see resendOtp's catch block below).
+  function startResendCooldown(seconds: number) {
+    if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+    setResendCooldown(seconds);
+    cooldownTimer.current = setInterval(() => {
+      setResendCooldown((prev) => {
+        if (prev <= 1) {
+          if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+    };
+  }, []);
 
   function reset() {
     setStep("destination");
@@ -90,6 +124,8 @@ export function WithdrawDialog({
     setWithdrawal(null);
     setCode("");
     setError(null);
+    setResendCooldown(0);
+    if (cooldownTimer.current) clearInterval(cooldownTimer.current);
   }
 
   function close() {
@@ -149,11 +185,64 @@ export function WithdrawDialog({
         body: { destination_id: destinationId, amount },
       });
       setWithdrawal(response);
+      setCode("");
+      startResendCooldown(60);
       setStep("two-factor");
+      if (!response.otp_sent) {
+        setError(
+          "We couldn't deliver the verification email — use Resend once the cooldown ends.",
+        );
+      }
     } catch (err) {
       setError(err instanceof ApiClientError ? err.message : "Could not create withdrawal");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function resendOtp() {
+    if (!withdrawal || resendCooldown > 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await apiMutate<OtpResendResult>(
+        `/api/v1/payouts/${withdrawal.withdrawal.id}/resend-otp`,
+        { accessToken: token, body: {} },
+      );
+      setWithdrawal({ ...withdrawal, ...response });
+      setCode("");
+      startResendCooldown(60);
+      if (!response.otp_sent) {
+        setError("We couldn't deliver the verification email — try again shortly.");
+      }
+    } catch (err) {
+      if (err instanceof ApiClientError) {
+        setError(err.message);
+        const retryAfter = /(\d+)\s*seconds?/.exec(err.message)?.[1];
+        if (retryAfter) startResendCooldown(Number(retryAfter));
+      } else {
+        setError("Could not resend the verification code");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelDuringOtp() {
+    if (!withdrawal) return;
+    setBusy(true);
+    try {
+      await apiMutate(`/api/v1/payouts/${withdrawal.withdrawal.id}/cancel`, {
+        accessToken: token,
+        body: { reason: "Cancelled during verification" },
+      });
+      onCompleted();
+    } catch {
+      // Best-effort — the dialog closes regardless; a stuck DRAFT
+      // withdrawal is still visible/cancellable from the withdrawals list.
+    } finally {
+      setBusy(false);
+      close();
     }
   }
 
@@ -362,26 +451,39 @@ export function WithdrawDialog({
           </div>
         )}
 
-        {step === "two-factor" && (
+        {step === "two-factor" && withdrawal && (
           <div className="mt-4 flex flex-col gap-3">
             <p className="text-on-surface-variant text-sm">
-              Enter the 6-digit confirmation code (see your audit log — no SMS/email delivery is
-              wired up yet).
+              Verification code sent to <span className="font-medium">{withdrawal.masked_email}</span>.
+              Enter it below to confirm this withdrawal. It expires in{" "}
+              {Math.round(withdrawal.expires_in_seconds / 60)} minutes.
             </p>
             <input
               value={code}
-              onChange={(e) => setCode(e.target.value)}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
               maxLength={6}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              pattern="\d{6}"
               className="bg-surface-container-high text-on-surface rounded-lg px-3 py-2 text-center font-mono text-lg tracking-widest"
               placeholder="000000"
             />
+            <button
+              type="button"
+              disabled={busy || resendCooldown > 0}
+              onClick={resendOtp}
+              className="text-primary text-left text-sm font-medium hover:underline disabled:text-on-surface-variant disabled:no-underline"
+            >
+              {resendCooldown > 0 ? `Resend code in ${resendCooldown}s` : "Resend code"}
+            </button>
             <div className="mt-2 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={close}
-                className="text-on-surface-variant rounded-lg px-4 py-2 text-sm"
+                disabled={busy}
+                onClick={cancelDuringOtp}
+                className="text-on-surface-variant rounded-lg px-4 py-2 text-sm disabled:opacity-50"
               >
-                Cancel
+                Cancel Withdrawal
               </button>
               <button
                 type="button"

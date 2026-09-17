@@ -52,3 +52,37 @@ def admin_withdrawal_review_email(
 {render_button(href=review_url, label="Review Withdrawal")}
 """
     return subject, render_email(app_url=app_url, preheader=subject, body_html=body)
+
+
+def withdrawal_otp_email(
+    *,
+    app_url: str,
+    tenant_name: str,
+    amount: Decimal,
+    currency: str,
+    masked_destination: str,
+    otp: str,
+    ttl_seconds: int,
+) -> tuple[str, str]:
+    """The withdrawal 2FA code itself — the one email in this codebase
+    that legitimately contains a live secret in its body. Never logged,
+    never persisted (see app/services/payouts.py's EmailEvent write,
+    which never includes the code), and this function's return value must
+    never be logged either."""
+    subject = "Infinity Radius Withdrawal Verification Code"
+    minutes = max(1, ttl_seconds // 60)
+    otp_display = " ".join(otp)  # "1 2 3 4 5 6" — easier to read/type correctly
+    body = f"""\
+<p>Use this verification code to confirm {_esc(tenant_name)}'s withdrawal of
+{_esc(currency)} {amount:,.2f} to {_esc(masked_destination)}.</p>
+<p style="text-align:center;margin:28px 0;">
+  <span style="display:inline-block;font-size:32px;font-weight:700;letter-spacing:8px;
+  color:#0f172a;background-color:#f1f5f9;border-radius:12px;padding:16px 24px;">{_esc(otp_display)}</span>
+</p>
+<p style="color:#64748b;font-size:13px;">This code expires in {minutes} minute{"s" if minutes != 1 else ""}
+and can only be used once.</p>
+<p style="color:#64748b;font-size:13px;">Infinity Radius will never ask you for this code by phone,
+chat, or email. If you did not request this withdrawal, contact support immediately and do not
+share this code with anyone.</p>
+"""
+    return subject, render_email(app_url=app_url, preheader=subject, body_html=body)

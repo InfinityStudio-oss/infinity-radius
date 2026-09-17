@@ -128,7 +128,7 @@ def _fake_transaction_query_completed(
 
 
 def test_full_disbursement_pipeline_reaches_success_and_can_be_reversed(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capture_withdrawal_otp: list[str]
 ) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
@@ -138,6 +138,7 @@ def test_full_disbursement_pipeline_reaches_success_and_can_be_reversed(
         admin_headers = auth_header(user_id=admin_id)
         ctx.new_settlement_config(tenant_id=tenant_id)
         ctx.new_tenant_feature_flags(tenant_id=tenant_id, payout_enabled=True)
+        ctx.new_tenant_verification(tenant_id=tenant_id, status="APPROVED", email_verified=True)
         asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
 
         destination_id = client.post(
@@ -157,7 +158,7 @@ def test_full_disbursement_pipeline_reaches_success_and_can_be_reversed(
             json={"destination_id": destination_id, "amount": "600.00"},
         )
         withdrawal_id = request_response.json()["withdrawal"]["id"]
-        code = request_response.json()["two_factor_code"]
+        code = capture_withdrawal_otp[-1]
 
         _fake_account_lookup(monkeypatch)
         _fake_transaction_process_inprogress(monkeypatch)
@@ -218,7 +219,7 @@ def test_full_disbursement_pipeline_reaches_success_and_can_be_reversed(
 
 
 def test_transport_error_during_submission_never_resubmits_and_reconciles_via_query(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capture_withdrawal_otp: list[str]
 ) -> None:
     """The critical timeout-safety case: transaction_process's HTTP call
     itself fails (timeout/connection error) — the withdrawal must stay
@@ -234,6 +235,7 @@ def test_transport_error_during_submission_never_resubmits_and_reconciles_via_qu
         owner_headers = auth_header(user_id=owner_id)
         ctx.new_settlement_config(tenant_id=tenant_id)
         ctx.new_tenant_feature_flags(tenant_id=tenant_id, payout_enabled=True)
+        ctx.new_tenant_verification(tenant_id=tenant_id, status="APPROVED", email_verified=True)
         asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
 
         destination_id = client.post(
@@ -252,7 +254,7 @@ def test_transport_error_during_submission_never_resubmits_and_reconciles_via_qu
             json={"destination_id": destination_id, "amount": "600.00"},
         )
         withdrawal_id = request_response.json()["withdrawal"]["id"]
-        code = request_response.json()["two_factor_code"]
+        code = capture_withdrawal_otp[-1]
 
         _fake_account_lookup(monkeypatch)
 

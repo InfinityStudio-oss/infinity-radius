@@ -36,10 +36,12 @@ from app.core.config import get_settings
 from app.core.enums import (
     MOBILE_MONEY_DESTINATION_CODES,
     DestinationCode,
+    EmailEventStatus,
+    EmailEventType,
     SettlementMode,
     WithdrawalStatus,
 )
-from app.core.errors import DomainValidationError, NotFoundError
+from app.core.errors import DomainValidationError, NotFoundError, RateLimitedError
 from app.core.money import DEFAULT_CURRENCY
 from app.core.pagination import ListParams
 from app.core.phone import normalize_tz_phone
@@ -54,13 +56,14 @@ from app.integrations.selcom_business.errors import (
 )
 from app.integrations.selcom_business.schemas import interpret_resultcode, money_from_provider
 from app.models.finance import Withdrawal, WithdrawalDestination, WithdrawalEvent
+from app.models.onboarding import EmailEvent
 from app.repositories.finance import (
     WithdrawalDestinationRepository,
     WithdrawalEventRepository,
     WithdrawalRepository,
 )
-from app.repositories.onboarding import TenantFeatureFlagsRepository
-from app.repositories.tenancy import TenantRepository
+from app.repositories.onboarding import TenantFeatureFlagsRepository, TenantVerificationRepository
+from app.repositories.tenancy import ProfileRepository, TenantRepository
 from app.schemas.finance import WithdrawalLookupPreviewResult
 from app.services.audit import write_audit_log
 from app.services.settlement_config import SettlementConfigService
@@ -77,6 +80,37 @@ def _mask_account(account_number: str | None) -> str | None:
     if len(account_number) <= 4:
         return "*" * len(account_number)
     return "*" * (len(account_number) - 4) + account_number[-4:]
+
+
+def _mask_destination(*, channel: str, account_number: str | None) -> str:
+    """Mobile numbers keep enough head+tail to stay recognizable to the
+    tenant reading the OTP email (e.g. "2557******123"); bank/Selcom
+    accounts keep only the last 4 digits (e.g. "************4567") — same
+    convention as most banks' own SMS/email OTP templates."""
+    if not account_number:
+        return "the saved destination"
+    if channel == "mobile_money" and len(account_number) > 7:
+        return f"{account_number[:4]}{'*' * (len(account_number) - 7)}{account_number[-3:]}"
+    return _mask_account(account_number) or "the saved destination"
+
+
+def _mask_email(email: str) -> str:
+    """"p***@example.com" — enough for the tenant to recognize their own
+    inbox, never enough to reveal it to someone who doesn't already know
+    it."""
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "***"
+    return f"{local[0]}***@{domain}" if local else f"***@{domain}"
+
+
+def _otp_expired(withdrawal: Withdrawal) -> bool:
+    if withdrawal.two_factor_expires_at is None:
+        return True
+    expires_at = withdrawal.two_factor_expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return datetime.now(UTC) > expires_at
 
 logger = structlog.get_logger("services.payouts")
 
@@ -224,6 +258,138 @@ class PayoutService:
             withdrawal, to_status=WithdrawalStatus.FAILED, actor_id=actor_id, reason=reason
         )
 
+    # ---------------------------------------------------------------- OTP
+
+    async def _resolve_verified_email(self, *, tenant_id: UUID, actor_id: UUID) -> str:
+        """The ONLY place a withdrawal OTP's destination address comes
+        from — the requester's own profile email, itself only ever set
+        from a verified Supabase Auth session (see app/core/security.py),
+        never a value the frontend can pass in. Refuses closed if that
+        email hasn't completed the real onboarding verification (see
+        app/services/onboarding.py's use of Supabase's own
+        email_confirmed_at, mirrored into TenantVerification.email_verified_at)."""
+        profile = await ProfileRepository(self.db).get_by_id(tenant_id=tenant_id, id=actor_id)
+        verification = await TenantVerificationRepository(self.db).get_by_tenant(
+            tenant_id=tenant_id
+        )
+        if (
+            profile is None
+            or not profile.email
+            or verification is None
+            or verification.email_verified_at is None
+        ):
+            raise DomainValidationError("Email verification is required before withdrawals.")
+        return profile.email
+
+    async def _issue_and_send_otp(
+        self, withdrawal: Withdrawal, *, email: str, actor_id: UUID, resend: bool
+    ) -> tuple[bool, int]:
+        """Generates a fresh OTP, emails it via Resend, and records a safe
+        (code-free) EmailEvent + audit trail either way. Never raises on a
+        delivery failure — the withdrawal simply stays DRAFT/awaiting-OTP
+        so the tenant can resend or cancel (see app/api/v1/payouts.py)."""
+        settings = get_settings()
+        destination = await self.destination_repo.get_by_id(
+            tenant_id=withdrawal.tenant_id, id=withdrawal.destination_id
+        )
+        tenant = await TenantRepository(self.db).get_by_id(tenant_id=None, id=withdrawal.tenant_id)
+        masked_destination = _mask_destination(
+            channel=destination.channel if destination else "",
+            account_number=destination.account_number if destination else None,
+        )
+
+        code = await self.two_factor.issue_challenge(withdrawal, sent_to_email=email)
+        await self.repo.update(
+            withdrawal,
+            otp_last_sent_at=datetime.now(UTC),
+            otp_send_count=withdrawal.otp_send_count + 1,
+        )
+
+        result = await ResendEmailService().send_withdrawal_otp_email(
+            to=email,
+            tenant_name=tenant.name if tenant else str(withdrawal.tenant_id),
+            amount=Decimal(withdrawal.amount),
+            currency=withdrawal.currency,
+            masked_destination=masked_destination,
+            otp=code,
+            ttl_seconds=settings.withdrawal_otp_ttl_seconds,
+        )
+
+        now = datetime.now(UTC)
+        self.db.add(
+            EmailEvent(
+                tenant_id=withdrawal.tenant_id,
+                recipient=email,
+                email_type=EmailEventType.WITHDRAWAL_OTP.value,
+                provider_message_id=result.provider_message_id,
+                status=(
+                    EmailEventStatus.SENT.value if result.sent else EmailEventStatus.FAILED.value
+                ),
+                sent_at=now if result.sent else None,
+                failed_at=None if result.sent else now,
+                error_message=result.error_message,
+            )
+        )
+        await self.db.flush()
+
+        await write_audit_log(
+            self.db,
+            tenant_id=withdrawal.tenant_id,
+            actor_id=actor_id,
+            action="withdrawal.otp_resent" if resend else "withdrawal.otp_sent",
+            target_type="withdrawal",
+            target_id=withdrawal.id,
+            metadata=None if result.sent else {"delivery_failed": True},
+        )
+
+        return result.sent, settings.withdrawal_otp_ttl_seconds
+
+    async def resend_otp(
+        self, *, tenant_id: UUID, withdrawal_id: UUID, actor_id: UUID
+    ) -> tuple[Withdrawal, bool, str, int]:
+        """Issues a brand new OTP, immediately invalidating the previous
+        one (issue_challenge always overwrites the stored hash/expiry/
+        attempt-counter — there is no path where both an old and new code
+        are simultaneously valid). Rate-limited by both a cooldown and a
+        per-withdrawal send cap so this can't be used to spam a tenant's
+        inbox or brute-force-by-resend."""
+        withdrawal = await self.repo.get_by_id_for_update(tenant_id=tenant_id, id=withdrawal_id)
+        if withdrawal is None:
+            raise NotFoundError("Withdrawal not found")
+        if withdrawal.requested_by != actor_id:
+            raise DomainValidationError(
+                "Only the requester can resend this withdrawal's verification code"
+            )
+        if withdrawal.status != WithdrawalStatus.DRAFT.value:
+            raise DomainValidationError(
+                f"Withdrawal is not awaiting a verification code (status: {withdrawal.status})"
+            )
+
+        settings = get_settings()
+        if withdrawal.otp_send_count >= settings.withdrawal_otp_max_sends:
+            raise DomainValidationError(
+                "Maximum number of verification code sends reached for this withdrawal — "
+                "cancel it and start a new withdrawal, or contact support."
+            )
+        if withdrawal.otp_last_sent_at is not None:
+            last_sent = withdrawal.otp_last_sent_at
+            if last_sent.tzinfo is None:
+                last_sent = last_sent.replace(tzinfo=UTC)
+            elapsed = (datetime.now(UTC) - last_sent).total_seconds()
+            remaining = settings.withdrawal_otp_resend_cooldown_seconds - elapsed
+            if remaining > 0:
+                retry_after = int(remaining) + 1
+                raise RateLimitedError(
+                    f"Please wait {retry_after} seconds before requesting a new code.",
+                    retry_after_seconds=retry_after,
+                )
+
+        email = await self._resolve_verified_email(tenant_id=tenant_id, actor_id=actor_id)
+        otp_sent, expires_in = await self._issue_and_send_otp(
+            withdrawal, email=email, actor_id=actor_id, resend=True
+        )
+        return withdrawal, otp_sent, _mask_email(email), expires_in
+
     # ------------------------------------------------------------- request
 
     async def request_withdrawal(
@@ -233,13 +399,12 @@ class PayoutService:
         actor_id: UUID,
         destination_id: UUID,
         amount: Decimal,
-    ) -> tuple[Withdrawal, str]:
-        """Verifies balance, row-locks and reserves it, then issues a 2FA
-        challenge. Returns (withdrawal, raw_two_factor_code) — the code is
-        also written to the audit trail as an interim delivery channel
-        (see app/services/two_factor.py's module docstring) but is handed
-        back here too so a caller with a real delivery channel could use
-        it directly once one exists."""
+    ) -> tuple[Withdrawal, bool, str, int]:
+        """Verifies balance, row-locks and reserves it, then emails a
+        fresh OTP to the requester's own verified email. Returns
+        (withdrawal, otp_sent, masked_email, expires_in_seconds) — the raw
+        code itself is never returned here or by any other response; see
+        _issue_and_send_otp and app/services/two_factor.py."""
         if amount <= 0:
             raise DomainValidationError("amount must be greater than zero")
 
@@ -268,6 +433,11 @@ class PayoutService:
                 "Payouts are not enabled for this tenant — a super admin must enable "
                 "the payout feature flag before withdrawals can be requested."
             )
+
+        # Resolved and validated before anything touches the wallet — a
+        # tenant whose owner email isn't verified never gets as far as a
+        # funds reservation.
+        email = await self._resolve_verified_email(tenant_id=tenant_id, actor_id=actor_id)
 
         threshold = get_settings().selcom_withdrawal_approval_threshold_tzs
         approval_required = amount > threshold
@@ -309,24 +479,21 @@ class PayoutService:
             target_id=withdrawal.id,
             metadata={"amount": str(amount)},
         )
-
-        code = await self.two_factor.issue_challenge(withdrawal)
         await write_audit_log(
             self.db,
             tenant_id=tenant_id,
             actor_id=actor_id,
-            action="withdrawal.two_factor_issued",
+            action="withdrawal.otp_requested",
             target_type="withdrawal",
             target_id=withdrawal.id,
-            metadata={
-                "code": code,
-                "expires_in_minutes": 10,
-                "delivery": "audit_log_interim_channel — no SMS/email provider "
-                "configured yet, see app/services/two_factor.py",
-            },
+            metadata=None,
         )
 
-        return withdrawal, code
+        otp_sent, expires_in = await self._issue_and_send_otp(
+            withdrawal, email=email, actor_id=actor_id, resend=False
+        )
+
+        return withdrawal, otp_sent, _mask_email(email), expires_in
 
     # -------------------------------------------------------------- 2FA
 
@@ -343,8 +510,25 @@ class PayoutService:
                 f"Withdrawal is not awaiting 2FA confirmation (status: {withdrawal.status})"
             )
 
-        verified = await self.two_factor.verify(withdrawal, code)
+        profile = await ProfileRepository(self.db).get_by_id(tenant_id=tenant_id, id=actor_id)
+        current_email = profile.email if profile else None
+
+        # Determined before verify() (which mutates two_factor_attempts on
+        # a wrong guess) so a genuinely-expired code is reported as
+        # otp_expired rather than otp_failed even on its first attempt.
+        was_already_expired = _otp_expired(withdrawal)
+
+        verified = await self.two_factor.verify(withdrawal, code, current_email=current_email)
         if verified:
+            await write_audit_log(
+                self.db,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                action="withdrawal.otp_verified",
+                target_type="withdrawal",
+                target_id=withdrawal.id,
+                metadata=None,
+            )
             if withdrawal.approval_required:
                 await self._transition(
                     withdrawal, to_status=WithdrawalStatus.PENDING_APPROVAL, actor_id=actor_id
@@ -364,6 +548,17 @@ class PayoutService:
             )
 
         if self.two_factor.is_exhausted(withdrawal):
+            settings = get_settings()
+            locked = withdrawal.two_factor_attempts >= settings.withdrawal_otp_max_attempts
+            await write_audit_log(
+                self.db,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                action="withdrawal.otp_locked" if locked else "withdrawal.otp_expired",
+                target_type="withdrawal",
+                target_id=withdrawal.id,
+                metadata=None,
+            )
             await self.wallet_service.release_reservation(
                 tenant_id=tenant_id, amount=Decimal(withdrawal.amount)
             )
@@ -377,6 +572,15 @@ class PayoutService:
                 withdrawal=withdrawal, verified=False, cancelled=True
             )
 
+        await write_audit_log(
+            self.db,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            action="withdrawal.otp_expired" if was_already_expired else "withdrawal.otp_failed",
+            target_type="withdrawal",
+            target_id=withdrawal.id,
+            metadata=None,
+        )
         return TwoFactorConfirmationResult(withdrawal=withdrawal, verified=False, cancelled=False)
 
     # ------------------------------------------------------ SUPER_ADMIN review

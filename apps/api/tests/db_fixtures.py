@@ -154,19 +154,27 @@ class SeededContext:
         return terms_id
 
     def new_tenant_verification(
-        self, *, tenant_id: UUID, status: str = "PENDING_VERIFICATION"
+        self,
+        *,
+        tenant_id: UUID,
+        status: str = "PENDING_VERIFICATION",
+        email_verified: bool = False,
     ) -> UUID:
         """Admin tenant-review tests need a tenant_verifications row —
         AdminTenantService requires one to exist (it's the real onboarding
         review record; new_tenant() alone doesn't create it, matching how
-        a tenant seeded directly for non-onboarding tests has none)."""
+        a tenant seeded directly for non-onboarding tests has none).
+        `email_verified=True` sets email_verified_at — PayoutService's
+        withdrawal-OTP flow requires this before it will send a code (see
+        app/services/payouts.py._resolve_verified_email)."""
         assert self._conn is not None
         verification_id = uuid4()
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO public.tenant_verifications (id, tenant_id, status, submitted_at) "
-                "VALUES (%s, %s, %s, now())",
-                (verification_id, tenant_id, status),
+                "INSERT INTO public.tenant_verifications "
+                "(id, tenant_id, status, submitted_at, email_verified_at) "
+                "VALUES (%s, %s, %s, now(), CASE WHEN %s THEN now() ELSE NULL END)",
+                (verification_id, tenant_id, status, email_verified),
             )
         return verification_id
 

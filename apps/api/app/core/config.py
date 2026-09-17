@@ -151,6 +151,21 @@ class Settings(BaseSettings):
     # approves or rejects it. Server-side only — never a frontend control.
     selcom_withdrawal_approval_threshold_tzs: Decimal = Decimal("100000")
 
+    # --- Withdrawal OTP (see app/services/two_factor.py) ---
+    # HMAC key for hashing withdrawal OTPs — a small (6-digit) keyspace
+    # means an unsalted/unkeyed hash would be brute-forceable offline if
+    # the DB ever leaked, so this key is required before any OTP can be
+    # issued or verified. Left unset until a real value is generated
+    # (`python -c "import secrets; print(secrets.token_hex(32))"`) and set
+    # in Railway Variables only — never committed, never sent to Vercel,
+    # and only the web service needs it (OTP verification is synchronous,
+    # never done from the Celery worker/beat).
+    otp_verification_secret: str | None = None
+    withdrawal_otp_ttl_seconds: int = 600
+    withdrawal_otp_max_attempts: int = 5
+    withdrawal_otp_resend_cooldown_seconds: int = 60
+    withdrawal_otp_max_sends: int = 5
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:

@@ -445,18 +445,36 @@ Run locally against the sandbox base URL first
 signing, lookup, process, query, and callback/reconciliation are all
 verified working end to end.
 
-### 2FA — an honest interim design
+### Withdrawal OTP — real email delivery via Resend
 
-There is no SMS/email provider integrated anywhere in this codebase.
-`app/services/two_factor.py` implements the confirmation-code *mechanism*
-for real (generate, hash, 10-minute expiry, rate-limited verification) —
-only the hash is ever stored, and the raw code is returned exactly once,
-at issuance, the same convention already used for RADIUS secrets and
-WireGuard private keys. Delivery is the explicit gap: until a real
-provider is wired in, the one-time code is recorded only in the audit
-trail (`audit_logs`, itself authenticated and role-gated), as an interim,
-auditable distribution path — not a public one, and not yet a true second
-factor. `WithdrawalRead` never exposes the code or its hash.
+`app/services/two_factor.py` generates a cryptographically secure 6-digit
+OTP (`secrets.randbelow`) and stores only an HMAC-SHA256 hash of it, keyed
+by `Settings.otp_verification_secret` — never a bare/unsalted hash, since a
+6-digit code's keyspace (1M values) would otherwise be brute-forceable
+offline from a DB leak alone. The raw code is handed directly to
+`ResendEmailService.send_withdrawal_otp_email` (`app/services/payouts.py`'s
+`_issue_and_send_otp`) and never persisted, logged, or returned by any API
+response — `WithdrawalRequestResult`/`WithdrawalOtpResendResult` only ever
+carry `otp_sent`/`masked_email`/`expires_in_seconds`.
+
+The email always goes to the requester's own **verified** email —
+resolved server-side from `profiles.email` + `tenant_verifications
+.email_verified_at` (the same Supabase-confirmed address the rest of the
+onboarding flow already trusts), never a frontend-supplied destination.
+An unverified email fails the withdrawal closed with a generic message
+before any funds are ever reserved.
+
+Configurable via `WITHDRAWAL_OTP_TTL_SECONDS` (default 600),
+`WITHDRAWAL_OTP_MAX_ATTEMPTS` (5), `WITHDRAWAL_OTP_RESEND_COOLDOWN_SECONDS`
+(60), and `WITHDRAWAL_OTP_MAX_SENDS` (5) — a resend always invalidates the
+previous code (issue_challenge overwrites the stored hash/expiry/attempt
+counter atomically under the withdrawal's row lock), and an OTP that's
+expired or has exhausted its attempts cancels the withdrawal outright
+(releasing the reservation) rather than leaving it stuck. `WithdrawalRead`
+exposes only `two_factor_confirmed_at` (a timestamp, not the code) — the
+one thing a reviewing Super Admin is allowed to know about 2FA state.
+
+SMS is out of scope — email via Resend is the only channel.
 
 ## Tenant dashboard
 

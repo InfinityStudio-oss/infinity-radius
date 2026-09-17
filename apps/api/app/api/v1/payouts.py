@@ -27,6 +27,7 @@ from app.schemas.finance import (
     WithdrawalEventRead,
     WithdrawalLookupPreviewRequest,
     WithdrawalLookupPreviewResult,
+    WithdrawalOtpResendResult,
     WithdrawalRead,
     WithdrawalRequestResult,
     WithdrawalTwoFactorConfirm,
@@ -59,20 +60,34 @@ async def request_payout(
     db: AsyncSession = Depends(get_db),
 ) -> WithdrawalRequestResult:
     service = PayoutService(db)
-    withdrawal, code = await service.request_withdrawal(
+    withdrawal, otp_sent, masked_email, expires_in = await service.request_withdrawal(
         tenant_id=ctx.tenant_id,
         actor_id=ctx.user.id,
         destination_id=payload.destination_id,
         amount=payload.amount,
     )
     await db.commit()
-    # No ApiResponse envelope here on purpose — WithdrawalRequestResult
-    # carries the one-time 2FA code, which must never be wrapped in the
-    # generic response shape every other read uses (a reviewer scanning
-    # response shapes for "does this ever return a secret" should be able
-    # to spot this one immediately).
     return WithdrawalRequestResult(
-        withdrawal=WithdrawalRead.model_validate(withdrawal), two_factor_code=code
+        withdrawal=WithdrawalRead.model_validate(withdrawal),
+        otp_sent=otp_sent,
+        masked_email=masked_email,
+        expires_in_seconds=expires_in,
+    )
+
+
+@router.post("/{withdrawal_id}/resend-otp", response_model=WithdrawalOtpResendResult)
+async def resend_payout_otp(
+    withdrawal_id: UUID,
+    ctx: TenantContext = Depends(require_requester),
+    db: AsyncSession = Depends(get_db),
+) -> WithdrawalOtpResendResult:
+    service = PayoutService(db)
+    _, otp_sent, masked_email, expires_in = await service.resend_otp(
+        tenant_id=ctx.tenant_id, withdrawal_id=withdrawal_id, actor_id=ctx.user.id
+    )
+    await db.commit()
+    return WithdrawalOtpResendResult(
+        otp_sent=otp_sent, masked_email=masked_email, expires_in_seconds=expires_in
     )
 
 

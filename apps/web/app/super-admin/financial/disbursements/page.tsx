@@ -14,6 +14,9 @@ interface PendingWithdrawal {
   currency: string;
   destination_id: string;
   verified_recipient_name: string | null;
+  // Never the OTP itself — only whether it was verified. See
+  // app/schemas/finance.py's WithdrawalRead.
+  two_factor_confirmed_at: string | null;
   created_at: string;
 }
 
@@ -83,6 +86,11 @@ export default function DisbursementsPage() {
             key: "verified_recipient_name",
             header: "Recipient",
             render: (row) => row.verified_recipient_name ?? "Not yet verified",
+          },
+          {
+            key: "two_factor_confirmed_at",
+            header: "2FA Verified",
+            render: (row) => (row.two_factor_confirmed_at ? "Yes" : "No"),
           },
           {
             key: "created_at",

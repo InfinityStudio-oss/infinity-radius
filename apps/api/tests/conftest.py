@@ -47,12 +47,16 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 # asserts the real, safe-by-default value via Settings' own field default,
 # not this override.
 os.environ.setdefault("SELCOM_DISBURSEMENT_ENABLED", "true")
+# Withdrawal OTPs are HMAC-hashed with this — never a real secret, but
+# every withdrawal-request test needs *some* value or OTP issuance fails
+# closed (see app/services/two_factor.py).
+os.environ.setdefault("OTP_VERIFICATION_SECRET", "test-only-otp-secret-do-not-use-in-prod")
 
 # Registers tests/onboarding_helpers.py's fixtures (mock_supabase_admin) for
 # every test module, so onboarding/admin-tenant tests can use it as a plain
 # parameter without importing it directly (which ruff flags as a false-
 # positive F811 "redefinition" against the same-named test parameter).
-pytest_plugins = ["tests.onboarding_helpers"]
+pytest_plugins = ["tests.onboarding_helpers", "tests.payout_helpers"]
 
 
 @pytest.fixture(autouse=True)

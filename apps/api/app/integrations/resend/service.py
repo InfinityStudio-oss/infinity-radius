@@ -183,3 +183,27 @@ class ResendEmailService:
             html=html,
             log_context="admin_withdrawal_review",
         )
+
+    async def send_withdrawal_otp_email(
+        self,
+        *,
+        to: str,
+        tenant_name: str,
+        amount: Decimal,
+        currency: str,
+        masked_destination: str,
+        otp: str,
+        ttl_seconds: int,
+    ) -> EmailSendResult:
+        subject, html = withdrawal_templates.withdrawal_otp_email(
+            app_url=self._config.app_url,
+            tenant_name=tenant_name,
+            amount=amount,
+            currency=currency,
+            masked_destination=masked_destination,
+            otp=otp,
+            ttl_seconds=ttl_seconds,
+        )
+        # log_context only, never the OTP itself — _send's own failure log
+        # only ever includes the Resend error string, never `html`/`otp`.
+        return await self._send(to=to, subject=subject, html=html, log_context="withdrawal_otp")

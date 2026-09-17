@@ -27,11 +27,13 @@ class ApiError(Exception):
         code: str,
         message: str,
         status_code: int = status.HTTP_400_BAD_REQUEST,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class NotFoundError(ApiError):
@@ -57,6 +59,20 @@ class DomainValidationError(ApiError):
         )
 
 
+class RateLimitedError(ApiError):
+    """A per-resource cooldown/cap, distinct from the global IP-based rate
+    limit middleware — e.g. the withdrawal OTP resend cooldown. Carries
+    retry_after_seconds so the client can show an accurate countdown."""
+
+    def __init__(self, message: str, *, retry_after_seconds: int) -> None:
+        super().__init__(
+            code="rate_limited",
+            message=message,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+
 def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 
@@ -69,9 +85,15 @@ def _error_body(*, code: str, message: str, request_id: str) -> dict[str, object
 
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+    headers = (
+        {"Retry-After": str(exc.retry_after_seconds)}
+        if exc.retry_after_seconds is not None
+        else None
+    )
     return JSONResponse(
         status_code=exc.status_code,
         content=_error_body(code=exc.code, message=exc.message, request_id=_request_id(request)),
+        headers=headers,
     )
 
 

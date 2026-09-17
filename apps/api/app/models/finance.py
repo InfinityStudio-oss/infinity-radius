@@ -303,6 +303,19 @@ class Withdrawal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     two_factor_confirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Resend-cooldown/cap bookkeeping for the OTP email — see
+    # app/services/payouts.py's resend_otp and
+    # Settings.withdrawal_otp_resend_cooldown_seconds/_max_sends.
+    otp_last_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    otp_send_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # The exact address the current OTP was sent to, snapshotted at
+    # issue/resend time — verification compares this against the
+    # requester's live profile email and refuses if they've diverged
+    # (e.g. the account's email changed mid-flow), rather than silently
+    # accepting a code that was never actually seen by the current email.
+    otp_sent_to_email: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class WithdrawalEvent(UUIDPrimaryKeyMixin, Base):

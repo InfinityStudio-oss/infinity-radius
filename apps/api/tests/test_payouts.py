@@ -44,11 +44,14 @@ async def _credit_available(tenant_id: UUID, actor_id: UUID, amount: str) -> Non
 
 def _enable_payouts(ctx: SeededContext, *, tenant_id: UUID) -> None:
     """Every test that requests a real withdrawal through PayoutService
-    must set both of these up first: settlement mode (request_withdrawal
-    refuses to run for a tenant still in the default
-    direct_merchant_settlement mode) and the payout_enabled feature flag."""
+    must set all three of these up first: settlement mode
+    (request_withdrawal refuses to run for a tenant still in the default
+    direct_merchant_settlement mode), the payout_enabled feature flag, and
+    a verified owner email (the withdrawal OTP flow refuses to issue a
+    code otherwise — see app/services/payouts.py._resolve_verified_email)."""
     ctx.new_settlement_config(tenant_id=tenant_id)
     ctx.new_tenant_feature_flags(tenant_id=tenant_id, payout_enabled=True)
+    ctx.new_tenant_verification(tenant_id=tenant_id, status="APPROVED", email_verified=True)
 
 
 def _create_destination(
@@ -182,7 +185,9 @@ def test_request_withdrawal_is_blocked_when_payout_feature_flag_is_disabled() ->
     assert "not enabled" in response.json()["error"]["message"]
 
 
-def test_request_withdrawal_reserves_funds_and_issues_a_two_factor_code() -> None:
+def test_request_withdrawal_reserves_funds_and_sends_a_safe_otp_email(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -201,7 +206,17 @@ def test_request_withdrawal_reserves_funds_and_issues_a_two_factor_code() -> Non
         body = withdrawal_response.json()
         assert body["withdrawal"]["status"] == "DRAFT"
         assert body["withdrawal"]["approval_required"] is False
-        assert len(body["two_factor_code"]) == 6
+        assert body["otp_sent"] is True
+        assert body["masked_email"].startswith("") and "@" in body["masked_email"]
+        assert body["expires_in_seconds"] == 600
+        # The OTP itself must never appear anywhere in the response, under
+        # any key.
+        assert "two_factor_code" not in body
+        assert "otp" not in body
+        assert "code" not in body
+        assert len(capture_withdrawal_otp) == 1
+        otp = capture_withdrawal_otp[0]
+        assert len(otp) == 6 and otp.isdigit()
 
         wallet_response = client.get("/api/v1/wallet", headers=headers)
 
@@ -210,15 +225,27 @@ def test_request_withdrawal_reserves_funds_and_issues_a_two_factor_code() -> Non
             cur.execute(
                 'SELECT "metadata" FROM audit_logs WHERE action = %s '
                 "ORDER BY created_at DESC LIMIT 1",
-                ("withdrawal.two_factor_issued",),
+                ("withdrawal.otp_sent",),
             )
             row = cur.fetchone()
+            cur.execute(
+                "SELECT recipient, email_type, status FROM email_events "
+                "WHERE email_type = 'WITHDRAWAL_OTP' ORDER BY created_at DESC LIMIT 1"
+            )
+            email_event = cur.fetchone()
 
     wallet_data = wallet_response.json()["data"]
     assert wallet_data["available_balance_tzs"] == "400.00"
     assert wallet_data["reserved_balance_tzs"] == "600.00"
+    # The audit event fired, and never carries the code (metadata is None
+    # on a successful send — see app/services/payouts.py._issue_and_send_otp).
     assert row is not None
-    assert row[0]["code"] == body["two_factor_code"]
+    assert row[0] is None
+    # A real (mocked) EmailEvent row was written, recipient only — no body,
+    # no OTP, no OTP hash — email_events has no body column at all.
+    assert email_event is not None
+    assert email_event[2] == "SENT"
+    assert otp not in str(email_event)
 
 
 def test_request_withdrawal_marks_approval_required_over_the_threshold() -> None:
@@ -314,8 +341,15 @@ def test_request_withdrawal_is_blocked_when_disbursement_is_disabled(
 
 
 def _request_withdrawal(
-    ctx: SeededContext, *, owner_headers: dict[str, str], amount: str = "600.00"
+    ctx: SeededContext,
+    *,
+    owner_headers: dict[str, str],
+    otp_inbox: list[str],
+    amount: str = "600.00",
 ) -> tuple[str, str]:
+    """Returns (withdrawal_id, otp) — the OTP comes from otp_inbox (the
+    capture_withdrawal_otp fixture standing in for "reading the email"),
+    never from the API response, which never carries it."""
     destination_id = _create_destination(owner_headers)
     response = client.post(
         "/api/v1/payouts",
@@ -324,10 +358,15 @@ def _request_withdrawal(
     )
     assert response.status_code == 201
     body = response.json()
-    return body["withdrawal"]["id"], body["two_factor_code"]
+    assert "two_factor_code" not in body
+    assert "otp" not in body
+    assert body["otp_sent"] is True
+    return body["withdrawal"]["id"], otp_inbox[-1]
 
 
-def test_confirm_two_factor_with_wrong_code_increments_attempts_then_cancels() -> None:
+def test_confirm_two_factor_with_wrong_code_increments_attempts_then_cancels(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -335,7 +374,9 @@ def test_confirm_two_factor_with_wrong_code_increments_attempts_then_cancels() -
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
-        withdrawal_id, _real_code = _request_withdrawal(ctx, owner_headers=headers)
+        withdrawal_id, _real_code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
 
         last_response = None
         for _ in range(5):
@@ -357,7 +398,9 @@ def test_confirm_two_factor_with_wrong_code_increments_attempts_then_cancels() -
     assert wallet_data["reserved_balance_tzs"] == "0.00"
 
 
-def test_confirm_two_factor_at_or_under_threshold_auto_submits_and_fails_closed() -> None:
+def test_confirm_two_factor_at_or_under_threshold_auto_submits_and_fails_closed(
+    capture_withdrawal_otp: list[str],
+) -> None:
     """No SUPER_ADMIN step at all for an at/under-threshold amount — 2FA
     confirmation itself triggers submission. Selcom Business credentials
     are unset in the test environment, so it should fail closed (never a
@@ -369,7 +412,9 @@ def test_confirm_two_factor_at_or_under_threshold_auto_submits_and_fails_closed(
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="600.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="600.00"
+        )
 
         response = client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
@@ -390,7 +435,9 @@ def test_confirm_two_factor_at_or_under_threshold_auto_submits_and_fails_closed(
     assert statuses == ["DRAFT", "APPROVED", "FAILED"]
 
 
-def test_confirm_two_factor_over_threshold_moves_to_pending_approval_not_selcom() -> None:
+def test_confirm_two_factor_over_threshold_moves_to_pending_approval_not_selcom(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -398,7 +445,9 @@ def test_confirm_two_factor_over_threshold_moves_to_pending_approval_not_selcom(
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "200000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="150000.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
 
         response = client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
@@ -406,9 +455,13 @@ def test_confirm_two_factor_over_threshold_moves_to_pending_approval_not_selcom(
 
     assert response.status_code == 200
     assert response.json()["data"]["status"] == "PENDING_APPROVAL"
+    # Super Admin sees only a verified-at timestamp, never the code itself.
+    assert response.json()["data"]["two_factor_confirmed_at"] is not None
 
 
-def test_only_the_requester_can_confirm_their_own_two_factor_code() -> None:
+def test_only_the_requester_can_confirm_their_own_two_factor_code(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -418,7 +471,9 @@ def test_only_the_requester_can_confirm_their_own_two_factor_code() -> None:
         other_headers = auth_header(user_id=other_owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers)
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
 
         response = client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa",
@@ -429,7 +484,9 @@ def test_only_the_requester_can_confirm_their_own_two_factor_code() -> None:
     assert response.status_code == 422
 
 
-def test_tenant_side_approve_and_reject_routes_no_longer_exist() -> None:
+def test_tenant_side_approve_and_reject_routes_no_longer_exist(
+    capture_withdrawal_otp: list[str],
+) -> None:
     """Approval is a SUPER_ADMIN-only action now — see
     app/api/v1/admin_withdrawals.py. A tenant admin must never be able to
     approve/reject a withdrawal, including their own."""
@@ -440,7 +497,9 @@ def test_tenant_side_approve_and_reject_routes_no_longer_exist() -> None:
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "200000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="150000.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
         client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
         )
@@ -458,7 +517,9 @@ def test_tenant_side_approve_and_reject_routes_no_longer_exist() -> None:
     assert reject_response.status_code == 404
 
 
-def test_super_admin_approval_submits_to_selcom_and_fails_closed_when_unconfigured() -> None:
+def test_super_admin_approval_submits_to_selcom_and_fails_closed_when_unconfigured(
+    capture_withdrawal_otp: list[str],
+) -> None:
     """Selcom Business credentials are unset in the test environment —
     SUPER_ADMIN approval should still transition PENDING_APPROVAL ->
     APPROVED -> FAILED (never silently stuck, never a fake success),
@@ -471,7 +532,9 @@ def test_super_admin_approval_submits_to_selcom_and_fails_closed_when_unconfigur
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "200000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="150000.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
         client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
         )
@@ -495,7 +558,9 @@ def test_super_admin_approval_submits_to_selcom_and_fails_closed_when_unconfigur
     assert statuses == ["DRAFT", "PENDING_APPROVAL", "APPROVED", "FAILED"]
 
 
-def test_only_super_admin_can_approve_a_pending_withdrawal() -> None:
+def test_only_super_admin_can_approve_a_pending_withdrawal(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -505,7 +570,9 @@ def test_only_super_admin_can_approve_a_pending_withdrawal() -> None:
         tenant_admin_headers = auth_header(user_id=tenant_admin_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "200000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="150000.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
         client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
         )
@@ -519,7 +586,9 @@ def test_only_super_admin_can_approve_a_pending_withdrawal() -> None:
     assert response.status_code == 403
 
 
-def test_super_admin_reject_requires_a_reason_and_releases_the_reservation() -> None:
+def test_super_admin_reject_requires_a_reason_and_releases_the_reservation(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -528,7 +597,9 @@ def test_super_admin_reject_requires_a_reason_and_releases_the_reservation() -> 
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "200000.00"))
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="150000.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
         client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
         )
@@ -553,7 +624,9 @@ def test_super_admin_reject_requires_a_reason_and_releases_the_reservation() -> 
     assert wallet_data["reserved_balance_tzs"] == "0.00"
 
 
-def test_super_admin_withdrawal_queue_lists_only_pending_approval() -> None:
+def test_super_admin_withdrawal_queue_lists_only_pending_approval(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -563,11 +636,17 @@ def test_super_admin_withdrawal_queue_lists_only_pending_approval() -> None:
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "300000.00"))
         # Under threshold — never enters the queue.
-        _request_withdrawal(ctx, owner_headers=headers, amount="600.00")
+        _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="600.00"
+        )
         # Over threshold, 2FA not yet confirmed — not in the queue yet either.
-        _request_withdrawal(ctx, owner_headers=headers, amount="150000.00")
+        _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
         # Over threshold, 2FA confirmed — this is the only one that should show up.
-        withdrawal_id, code = _request_withdrawal(ctx, owner_headers=headers, amount="120000.00")
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="120000.00"
+        )
         client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
         )
@@ -581,7 +660,9 @@ def test_super_admin_withdrawal_queue_lists_only_pending_approval() -> None:
     assert tenant_scoped_attempt.status_code == 403
 
 
-def test_requester_can_cancel_their_own_draft_withdrawal() -> None:
+def test_requester_can_cancel_their_own_draft_withdrawal(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -589,7 +670,9 @@ def test_requester_can_cancel_their_own_draft_withdrawal() -> None:
         headers = auth_header(user_id=owner_id)
         _enable_payouts(ctx, tenant_id=tenant_id)
         asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
-        withdrawal_id, _code = _request_withdrawal(ctx, owner_headers=headers)
+        withdrawal_id, _code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
 
         cancel_response = client.post(
             f"/api/v1/payouts/{withdrawal_id}/cancel",
@@ -603,3 +686,272 @@ def test_requester_can_cancel_their_own_draft_withdrawal() -> None:
     wallet_data = wallet_response.json()["data"]
     assert wallet_data["available_balance_tzs"] == "1000.00"
     assert wallet_data["reserved_balance_tzs"] == "0.00"
+
+
+# ------------------------------------------------------------- OTP: email gate
+
+
+def test_request_withdrawal_rejects_unverified_email_before_reserving_funds() -> None:
+    """_enable_payouts's email_verified=True is deliberately NOT applied
+    here — settlement mode + payout_enabled are set, but the owner's
+    email was never verified, matching a real just-onboarded tenant whose
+    verification link was never clicked."""
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        ctx.new_settlement_config(tenant_id=tenant_id)
+        ctx.new_tenant_feature_flags(tenant_id=tenant_id, payout_enabled=True)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        destination_id = _create_destination(headers)
+
+        response = client.post(
+            "/api/v1/payouts",
+            headers=headers,
+            json={"destination_id": destination_id, "amount": "500.00"},
+        )
+        wallet_response = client.get("/api/v1/wallet", headers=headers)
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["message"]
+        == "Email verification is required before withdrawals."
+    )
+    # Never reserved — the gate runs before any wallet mutation.
+    wallet_data = wallet_response.json()["data"]
+    assert wallet_data["available_balance_tzs"] == "1000.00"
+    assert wallet_data["reserved_balance_tzs"] == "0.00"
+
+
+# ---------------------------------------------------------------- OTP: resend
+
+
+def test_resend_otp_before_cooldown_returns_429_with_retry_after(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        withdrawal_id, _code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
+
+        response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/resend-otp", headers=headers
+        )
+
+    assert response.status_code == 429
+    assert "Retry-After" in response.headers
+    assert response.json()["error"]["code"] == "rate_limited"
+    # No second OTP was ever generated/sent.
+    assert len(capture_withdrawal_otp) == 1
+
+
+def test_resend_otp_after_cooldown_invalidates_the_old_code(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        withdrawal_id, old_code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
+
+        # Simulate the cooldown having elapsed — no sleep in a unit test.
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE withdrawals SET otp_last_sent_at = now() - interval '61 seconds' "
+                "WHERE id = %s",
+                (withdrawal_id,),
+            )
+
+        resend_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/resend-otp", headers=headers
+        )
+        assert resend_response.status_code == 200
+        resend_body = resend_response.json()
+        assert resend_body["otp_sent"] is True
+        assert "otp" not in resend_body and "code" not in resend_body
+        assert len(capture_withdrawal_otp) == 2
+        new_code = capture_withdrawal_otp[-1]
+        assert new_code != old_code
+
+        old_code_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/confirm-2fa",
+            headers=headers,
+            json={"code": old_code},
+        )
+        new_code_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/confirm-2fa",
+            headers=headers,
+            json={"code": new_code},
+        )
+
+    assert old_code_response.status_code == 422
+    assert new_code_response.status_code == 200
+    assert new_code_response.json()["data"]["two_factor_confirmed_at"] is not None
+
+
+def test_resend_otp_enforces_max_sends_per_withdrawal(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        withdrawal_id, _code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
+
+        assert ctx._conn is not None
+
+        last_response = None
+        # Send #1 already happened in the request itself — 4 more resends
+        # reach WITHDRAWAL_OTP_MAX_SENDS (5); the 5th resend attempt (6th
+        # send overall) must be refused.
+        for _ in range(5):
+            with ctx._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE withdrawals SET otp_last_sent_at = now() - interval '61 seconds' "
+                    "WHERE id = %s",
+                    (withdrawal_id,),
+                )
+            last_response = client.post(
+                f"/api/v1/payouts/{withdrawal_id}/resend-otp", headers=headers
+            )
+
+    assert last_response is not None
+    assert last_response.status_code == 422
+    assert "Maximum number of verification code sends" in last_response.json()["error"]["message"]
+    # 1 initial send + 4 successful resends = 5 total, the 5th resend call refused.
+    assert len(capture_withdrawal_otp) == 5
+
+
+def test_resend_otp_rejects_a_withdrawal_that_already_left_draft(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        withdrawal_id, _code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
+        client.post(
+            f"/api/v1/payouts/{withdrawal_id}/cancel", headers=headers, json={"reason": "test"}
+        )
+
+        response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/resend-otp", headers=headers
+        )
+
+    assert response.status_code == 422
+    assert "not awaiting a verification code" in response.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------- OTP: expiry
+
+
+def test_expired_otp_is_rejected_cancels_and_releases_funds(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    """Mirrors the existing max-attempts behavior (see
+    test_confirm_two_factor_with_wrong_code_increments_attempts_then_cancels):
+    an expired code is exhausted on its very first verify attempt, so it
+    cancels immediately rather than leaving the withdrawal indefinitely
+    reserved — the tenant must request a fresh withdrawal, not just a
+    fresh code, once expiry is hit."""
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE withdrawals SET two_factor_expires_at = now() - interval '1 second' "
+                "WHERE id = %s",
+                (withdrawal_id,),
+            )
+
+        verify_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
+        )
+        get_response = client.get(f"/api/v1/payouts/{withdrawal_id}", headers=headers)
+        wallet_response = client.get("/api/v1/wallet", headers=headers)
+
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT action FROM audit_logs WHERE target_id = %s AND action LIKE %s "
+                "ORDER BY created_at DESC LIMIT 1",
+                (withdrawal_id, "withdrawal.otp_%"),
+            )
+            last_otp_event = cur.fetchone()
+
+    assert verify_response.status_code == 422
+    assert "cancelled" in verify_response.json()["error"]["message"]
+    assert get_response.json()["data"]["status"] == "CANCELLED"
+    assert get_response.json()["data"]["two_factor_confirmed_at"] is None
+    wallet_data = wallet_response.json()["data"]
+    assert wallet_data["available_balance_tzs"] == "1000.00"
+    assert wallet_data["reserved_balance_tzs"] == "0.00"
+    # The specific reason recorded is "expired", distinct from "locked"
+    # (max attempts) — both happen to also cancel, but an operator
+    # reviewing the audit trail should be able to tell them apart.
+    assert last_otp_event is not None
+    assert last_otp_event[0] == "withdrawal.otp_expired"
+
+
+# -------------------------------------------------------------- OTP: idempotency
+
+
+def test_confirming_an_already_verified_withdrawal_again_is_refused(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    """Once 2FA has already moved the withdrawal past DRAFT, a repeated
+    confirm-2fa call (even with the correct, still-remembered code) must
+    never re-trigger a second Selcom submission or a second
+    PENDING_APPROVAL transition."""
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+        withdrawal_id, code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp
+        )
+
+        first_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
+        )
+        second_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/confirm-2fa", headers=headers, json={"code": code}
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 422
+    assert "not awaiting 2FA confirmation" in second_response.json()["error"]["message"]

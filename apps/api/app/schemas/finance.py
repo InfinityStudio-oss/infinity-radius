@@ -84,10 +84,13 @@ class WithdrawalDestinationCreate(BaseModel):
 
 
 class WithdrawalRead(BaseModel):
-    """Never carries a payout secret: no idempotency_key, no 2FA hash —
-    only what a tenant's finance team legitimately needs to see. The raw
-    2FA code is returned once by the request-withdrawal endpoint itself
-    (see app/api/v1/payouts.py), never re-readable afterward."""
+    """Never carries an OTP secret: no otp_hash, no plaintext code, no
+    expiry/attempt internals — only what a tenant's finance team or a
+    reviewing Super Admin legitimately needs to see. Super Admin review
+    only ever sees `two_factor_confirmed_at` (i.e. "2FA Verified: Yes/No"
+    once it's non-null) — never the code itself, which by the time a
+    withdrawal is even visible to a Super Admin has already been
+    consumed (see app/services/payouts.py.confirm_two_factor)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -109,6 +112,7 @@ class WithdrawalRead(BaseModel):
     reviewed_by: UUID | None
     reviewed_at: datetime | None
     review_notes: str | None
+    two_factor_confirmed_at: datetime | None
     submitted_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
@@ -139,20 +143,28 @@ class WithdrawalLookupPreviewResult(BaseModel):
 
 
 class WithdrawalRequestResult(BaseModel):
-    """The one and only place the raw 2FA code is ever returned. See
-    app/services/two_factor.py's module docstring: until a real SMS/email
-    provider is wired in, this is the interim (authenticated, audit-logged)
-    distribution path for the confirmation code."""
+    """Never carries the OTP itself — only confirms an email was (or
+    wasn't) sent, and where, in masked form. See
+    app/services/payouts.py.request_withdrawal / _issue_and_send_otp."""
 
     withdrawal: WithdrawalRead
-    two_factor_code: str = Field(
-        description="One-time confirmation code — expires in 10 minutes. Interim: "
-        "no SMS/email delivery is wired up yet, see the audit trail."
-    )
+    otp_sent: bool = Field(description="Whether the verification email was actually delivered")
+    masked_email: str = Field(description='e.g. "p***@example.com"')
+    expires_in_seconds: int
+
+
+class WithdrawalOtpResendResult(BaseModel):
+    """Same safe shape as WithdrawalRequestResult, without re-serializing
+    the whole withdrawal — the resend endpoint doesn't change anything
+    about it beyond the OTP itself."""
+
+    otp_sent: bool
+    masked_email: str
+    expires_in_seconds: int
 
 
 class WithdrawalTwoFactorConfirm(BaseModel):
-    code: str = Field(min_length=6, max_length=6, description="The 6-digit 2FA code")
+    code: str = Field(min_length=6, max_length=6, description="The 6-digit OTP")
 
 
 class WithdrawalApprovalRequest(BaseModel):

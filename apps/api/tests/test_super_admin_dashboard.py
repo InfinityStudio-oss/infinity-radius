@@ -73,7 +73,9 @@ def test_dashboard_summary_reconciliation_is_honestly_not_configured() -> None:
     assert data["reconciliation_exceptions"]["status"] == "not_configured"
 
 
-def test_dashboard_summary_reflects_real_cross_tenant_rows() -> None:
+def test_dashboard_summary_reflects_real_cross_tenant_rows(
+    capture_withdrawal_otp: list[str],
+) -> None:
     with SeededContext() as ctx_a, SeededContext() as ctx_b:
         admin_id = ctx_a.new_user(role_code="SUPER_ADMIN", tenant_id=None)
         admin_headers = auth_header(user_id=admin_id)
@@ -122,6 +124,7 @@ def test_dashboard_summary_reflects_real_cross_tenant_rows() -> None:
         # threshold) + confirm 2FA -> PENDING_APPROVAL.
         ctx_a.new_settlement_config(tenant_id=tenant_a)
         ctx_a.new_tenant_feature_flags(tenant_id=tenant_a, payout_enabled=True)
+        ctx_a.new_tenant_verification(tenant_id=tenant_a, status="APPROVED", email_verified=True)
         asyncio.run(_credit_available(tenant_a, admin_id, "200000.00"))
         destination_id = client.post(
             "/api/v1/payouts/destinations",
@@ -139,7 +142,7 @@ def test_dashboard_summary_reflects_real_cross_tenant_rows() -> None:
             json={"destination_id": destination_id, "amount": "150000.00"},
         )
         withdrawal_id = request_response.json()["withdrawal"]["id"]
-        code = request_response.json()["two_factor_code"]
+        code = capture_withdrawal_otp[-1]
         client.post(
             f"/api/v1/payouts/{withdrawal_id}/confirm-2fa",
             headers=auth_header(user_id=owner_a),
