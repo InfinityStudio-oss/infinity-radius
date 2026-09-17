@@ -9,8 +9,16 @@
 - **`apps/api`** — FastAPI on Railway. The only writer to the primary
   Supabase Postgres database via SQLAlchemy 2 (async) + Alembic. Verifies
   Supabase-issued JWTs on every request and enforces tenant/RBAC checks.
-- **`apps/worker`** — Celery worker + beat on Railway. Background/async jobs
-  (billing runs, RADIUS sync, expirations, reconciliation) against Redis.
+- **`apps/api`'s Celery worker/beat** — two separate Railway services
+  (`infinity-radius-worker`, `infinity-radius-beat`), both built from the
+  same `apps/api` root directory/Dockerfile as the web service, with their
+  Start Command overridden to `celery -A app.core.celery_app worker
+  --loglevel=INFO --concurrency=2` and `... beat --loglevel=INFO`
+  respectively. They run `app.core.celery_app` (not a separate app) because
+  the registered tasks need the API's own DB/service layer — see
+  `app/tasks/reconciliation.py`. `apps/worker` is an unused, dependency-free
+  skeleton package kept for a possible future job that genuinely doesn't
+  need the API's DB layer; nothing runs from it today.
 - **`apps/network-agent`** — FastAPI service on a separate, dedicated
   Network VPS (not Railway). The only component that speaks to MikroTik
   routers, over a WireGuard tunnel. Reached from `apps/api` over HTTPS with
