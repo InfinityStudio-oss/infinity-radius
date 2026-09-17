@@ -20,28 +20,31 @@ def render_email(*, app_url: str, preheader: str, body_html: str) -> str:
 <!doctype html>
 <html>
   <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width" /></head>
-  <body style="margin:0;padding:0;background-color:#f8fafc;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+  <body style="margin:0;padding:0;background-color:#eef2f7;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
     <span style="display:none;font-size:0;line-height:0;max-height:0;max-width:0;opacity:0;overflow:hidden;">{html.escape(preheader)}</span>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f8fafc;padding:32px 16px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#eef2f7;padding:40px 16px;">
       <tr>
         <td align="center">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background-color:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background-color:#ffffff;border-radius:20px;overflow:hidden;box-shadow:0 1px 3px rgba(15,23,42,0.06),0 8px 24px rgba(15,23,42,0.08);">
             <tr>
-              <td style="padding:28px 32px 0 32px;">
-                <img src="{logo_src}" alt="Infinity Radius" height="32" style="height:32px;width:auto;display:block;" />
+              <td style="height:5px;line-height:5px;font-size:0;background:linear-gradient(90deg,#151b2b,#0891b2,#22d3ee);">&nbsp;</td>
+            </tr>
+            <tr>
+              <td style="padding:32px 32px 8px 32px;">
+                <img src="{logo_src}" alt="Infinity Radius" height="40" style="height:40px;width:auto;display:block;" />
               </td>
             </tr>
             <tr>
-              <td style="padding:24px 32px 32px 32px;color:#0f172a;font-size:15px;line-height:1.6;">
+              <td style="padding:20px 32px 32px 32px;color:#0f172a;font-size:15px;line-height:1.65;">
                 {body_html}
               </td>
             </tr>
             <tr>
-              <td style="padding:20px 32px;background-color:#f8fafc;border-top:1px solid #e2e8f0;color:#64748b;font-size:12px;line-height:1.6;">
+              <td style="padding:22px 32px;background-color:#f8fafc;border-top:1px solid #eef2f7;color:#94a3b8;font-size:12px;line-height:1.7;">
                 Infinity Radius &mdash; Multi-tenant ISP billing, hotspot and WiFi management.<br />
-                Support: <a href="mailto:{SUPPORT_EMAIL}" style="color:#2563eb;">{SUPPORT_EMAIL}</a>
+                Support: <a href="mailto:{SUPPORT_EMAIL}" style="color:#2563eb;text-decoration:none;">{SUPPORT_EMAIL}</a>
                 &nbsp;&middot;&nbsp;
-                General: <a href="mailto:{GENERAL_EMAIL}" style="color:#2563eb;">{GENERAL_EMAIL}</a>
+                General: <a href="mailto:{GENERAL_EMAIL}" style="color:#2563eb;text-decoration:none;">{GENERAL_EMAIL}</a>
                 &nbsp;&middot;&nbsp;
                 Phone: {PHONE_DISPLAY}
               </td>

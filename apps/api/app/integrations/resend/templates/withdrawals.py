@@ -73,16 +73,26 @@ def withdrawal_otp_email(
     minutes = max(1, ttl_seconds // 60)
     otp_display = " ".join(otp)  # "1 2 3 4 5 6" — easier to read/type correctly
     body = f"""\
-<p>Use this verification code to confirm {_esc(tenant_name)}'s withdrawal of
-{_esc(currency)} {amount:,.2f} to {_esc(masked_destination)}.</p>
-<p style="text-align:center;margin:28px 0;">
-  <span style="display:inline-block;font-size:32px;font-weight:700;letter-spacing:8px;
-  color:#0f172a;background-color:#f1f5f9;border-radius:12px;padding:16px 24px;">{_esc(otp_display)}</span>
-</p>
-<p style="color:#64748b;font-size:13px;">This code expires in {minutes} minute{"s" if minutes != 1 else ""}
-and can only be used once.</p>
-<p style="color:#64748b;font-size:13px;">Infinity Radius will never ask you for this code by phone,
-chat, or email. If you did not request this withdrawal, contact support immediately and do not
-share this code with anyone.</p>
+<p style="margin:0 0 4px 0;color:#0891b2;font-size:13px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;">Withdrawal verification</p>
+<p style="margin:0 0 24px 0;font-size:16px;">Confirm <strong>{_esc(tenant_name)}</strong>'s withdrawal of
+<strong style="color:#151b2b;">{_esc(currency)} {amount:,.2f}</strong> to
+<strong style="color:#151b2b;">{_esc(masked_destination)}</strong> with the code below.</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;">
+  <tr>
+    <td align="center" style="background:linear-gradient(160deg,#151b2b,#1c2740);border-radius:16px;padding:28px 16px;">
+      <span style="display:inline-block;font-family:'SF Mono',Consolas,Menlo,monospace;font-size:36px;font-weight:700;letter-spacing:10px;color:#ffffff;">{_esc(otp_display)}</span>
+      <div style="margin-top:12px;font-size:12px;color:#22d3ee;font-weight:700;letter-spacing:0.05em;">EXPIRES IN {minutes} MINUTE{"S" if minutes != 1 else ""} &middot; SINGLE USE</div>
+    </td>
+  </tr>
+</table>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #eef2f7;padding-top:18px;">
+  <tr>
+    <td style="color:#64748b;font-size:13px;line-height:1.6;">
+      &#128274;&nbsp; Infinity Radius will never ask you for this code by phone, chat, or email.
+      If you did not request this withdrawal, contact support immediately and do not share this
+      code with anyone.
+    </td>
+  </tr>
+</table>
 """
     return subject, render_email(app_url=app_url, preheader=subject, body_html=body)
