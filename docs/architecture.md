@@ -596,23 +596,78 @@ a per-row "Re-query Provider" action for `PROCESSING`/`AMBIGUOUS` rows —
 never a resubmit/resend action, which does not exist anywhere in this
 API.
 
-**IP whitelist** — Railway's current static outbound IPs, live-reconfirmed
-via `railway outbound-network static-ip status` (not assumed from a
-historical list): `208.77.244.241`, `152.55.184.241`, `152.55.185.190` —
-unchanged since first documented. **Before any future production
-activation, re-run that same command** rather than trusting this list —
-Railway can change these, and the production Selcom portal must whitelist
-whatever is current at activation time.
+### Network model — which service needs which Selcom whitelist
 
-Both the web service (synchronous submission) and the worker service
-(reconciliation queries) make real outbound Selcom calls, so **both**
-need Static Outbound IP enabled with the same three addresses — this was
-found disabled on `infinity-radius-worker` during this task (only the web
-service had it) and has been enabled. Confirm this with the same command
-against `infinity-radius-worker` before production activation; a mismatch
-here would silently fail every production reconciliation query even
-though sandbox testing showed no problem (sandbox doesn't enforce the
-whitelist as strictly).
+Every real `SelcomBusinessClient` call site, by runtime (there is no
+hidden Beat call anywhere in this codebase):
+
+| Call site | Method | Operation | Runtime |
+|---|---|---|---|
+| `admin_diagnostics.py` | `diagnose_selcom_business` | `account/lookup` | web (SUPER_ADMIN diagnostic) |
+| `admin_diagnostics.py` | `selcom_provider_balance` | `balance` | web (SUPER_ADMIN diagnostic) |
+| `payouts.py` | `preview_lookup` | `account/lookup` | web (tenant preview, read-only) |
+| `payouts.py` | `_submit_to_selcom` | `account/lookup` + `transaction/process` | web only (`confirm_two_factor`, `approve_withdrawal`) — the only path that can move money |
+| `payouts.py` | `_reconcile_locked` | `transaction/query` | web (webhook, manual `/requery`) **and** worker (the scheduled `reconcile_pending_withdrawals` Celery task) |
+
+`infinity-radius-beat` never imports `SelcomBusinessClient` — it only
+schedules the task by name onto Redis; the task body (and any Selcom call
+inside it) only ever executes in the worker process.
+
+**Static Outbound IPs — live-reconfirmed via `railway outbound-network
+static-ip status`, not assumed:**
+
+- `infinity-radius` (web): enabled, `208.77.244.241`, `152.55.184.241`,
+  `152.55.185.190`
+- `infinity-radius-worker`: enabled (was found **disabled** during this
+  task — only the web service had it — and has since been enabled, then
+  redeployed so the change actually took effect on outbound traffic).
+  **Its IPs are a different set from web's**, not a copy:
+  `208.77.244.240`, `152.55.184.240`, `152.55.185.189`.
+- `infinity-radius-beat`: not needed and not enabled — it makes no Selcom
+  calls.
+
+**This is Case B** (worker ≠ web IP set) — the Disbursement whitelist
+must include all 6 addresses, not 3. Deduplicate only if a future Railway
+change happens to make them equal.
+
+| Service | Selcom usage | Static IP required | Collection whitelist | Disbursement whitelist |
+|---|---|---|---|---|
+| `infinity-radius` | Collection (future) + Disbursement | Yes | Yes | Yes |
+| `infinity-radius-worker` | Disbursement reconciliation/query only | Yes | No | Yes |
+| `infinity-radius-beat` | None | No | No | No |
+| Vercel (frontend) | None | No | No | No |
+| DigitalOcean Network VPS | None (Selcom is never reached from there) | No | No | No |
+
+**Collection whitelist** (future — Collection API is not implemented in
+this codebase): web/backend IPs only — `208.77.244.241`, `152.55.184.241`,
+`152.55.185.190`. Never worker's, unless Collection processing is ever
+moved there (it isn't).
+
+**Disbursement whitelist** (current, real): the union of both sets — all
+6 addresses: `208.77.244.241`, `152.55.184.241`, `152.55.185.190`,
+`208.77.244.240`, `152.55.184.240`, `152.55.185.189`.
+
+**A real, discovered constraint**: Selcom's sandbox disbursement app's
+whitelist UI caps out at **5 IP addresses** — one short of the 6 needed.
+Recommendation for sandbox (adopted): use the portal's "Continue without
+IP whitelisting" option rather than arbitrarily dropping one of worker's
+three HA-rotated addresses (Railway's static IP is high-availability and
+rotates traffic across all three unpredictably, so whitelisting only 2 of
+3 would cause intermittent, hard-to-diagnose rejections — worse than no
+whitelist for a sandbox with no real money at stake). Sandbox traffic was
+never observed being IP-rejected even before worker had a static IP at
+all, consistent with sandbox not enforcing this strictly. **This same cap
+may exist on the production portal and must be resolved properly (fewer
+static IPs, or a limit increase from Selcom) before relying on IP
+whitelisting for real money — "continue without whitelisting" is not an
+acceptable production posture.**
+
+**If Railway ever changes these static IPs** (networking reconfiguration,
+service recreation, IP reallocation) — re-run `railway outbound-network
+static-ip status` against both `infinity-radius` and
+`infinity-radius-worker` and update whichever Selcom whitelist(s) are
+active BEFORE relying on that service for provider calls again. Never
+treat a previously-documented IP list as permanent.
 
 **Custom API domain** — none exists yet; the public backend URL remains
 `https://infinity-radius-production.up.railway.app` (used as-is for the
@@ -625,10 +680,16 @@ has been run; `SELCOM_BUSINESS_ENVIRONMENT` remains `sandbox` and
 
 1. Obtain real production Selcom Business credentials (API key, RSA
    private key, account number) from Selcom.
-2. Re-check Railway's *current* static outbound IPs (see above — do not
-   trust the list printed here without re-verifying).
-3. Whitelist all current Railway outbound IPs in the production Selcom
-   portal.
+2. Re-check Railway's *current* static outbound IPs for BOTH
+   `infinity-radius` AND `infinity-radius-worker` (see above — do not
+   trust the list printed here without re-verifying; they are a
+   different set from each other, not a copy).
+3. Whitelist the union of both services' IPs (currently 6 addresses) in
+   the production Selcom disbursement application. **If the production
+   portal has the same 5-IP cap the sandbox portal does, resolve that
+   properly first** (request a limit increase from Selcom, or reduce to
+   fewer static IPs per service) — do not fall back to "continue without
+   whitelisting" for production; that is a sandbox-only accommodation.
 4. Configure the production callback URL in the Selcom portal (same path,
    `/api/v1/webhooks/selcom-business/disbursement`, against the real
    production backend URL).
