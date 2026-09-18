@@ -212,6 +212,24 @@ class Settings(BaseSettings):
     withdrawal_otp_resend_cooldown_seconds: int = 60
     withdrawal_otp_max_sends: int = 5
 
+    # --- Internal worker->web disbursement-reconciliation auth (see
+    # app/core/internal_auth.py, app/api/v1/internal_disbursements.py,
+    # app/integrations/internal_web/client.py) ---
+    # Dedicated HMAC secret for the worker to call web's internal
+    # reconciliation endpoint over Railway private networking, so the
+    # Celery worker never needs Selcom Business credentials/egress itself
+    # (only web's Static Outbound IPs need Selcom whitelisting). Deliberately
+    # separate from otp_verification_secret and the Network Agent key —
+    # never shared across trust boundaries. Required on web (to verify) and
+    # worker (to sign); generate with
+    # `python -c "import secrets; print(secrets.token_hex(32))"`.
+    internal_worker_web_hmac_key: str | None = None
+    # Replay-protection timestamp tolerance for internal HMAC requests.
+    internal_request_max_skew_seconds: int = 90
+    # Worker-only: base URL of the web service reached over Railway private
+    # networking (e.g. "http://<RAILWAY_PRIVATE_DOMAIN>:8000"). Unset on web.
+    internal_web_base_url: str | None = None
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:

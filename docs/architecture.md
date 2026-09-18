@@ -573,12 +573,18 @@ withdrawal status except `CANCELLED`/`REJECTED`/`FAILED`
 (`WithdrawalRepository.daily_totals`) — an operator should confirm this
 exact counting policy before relying on it as the final word.
 
-**Environment variable least privilege** — `infinity-radius` (web) and
-`infinity-radius-worker` both hold Selcom/Resend credentials (web submits
-synchronously; worker's reconciliation sweep queries Selcom and now also
-sends stale-alert email). `infinity-radius-beat` holds neither — it only
-ever schedules the task by name, never executes its body — plus none of
-`SUPABASE_SECRET_KEY`/`SUPER_ADMIN_REVIEW_EMAIL`/`NETWORK_AGENT_*` either.
+**Environment variable least privilege** — after Option B, only
+`infinity-radius` (web) holds Selcom credentials
+(`SELCOM_BUSINESS_API_KEY`/`SELCOM_BUSINESS_PRIVATE_KEY_B64`/
+`SELCOM_BUSINESS_ACCOUNT_NUMBER`/`SELCOM_BUSINESS_BASE_URL`) — verified
+removed from `infinity-radius-worker` (see "Network model" below).
+`infinity-radius-worker` still holds Resend credentials (it sends the
+stale-withdrawal alert email) and now also
+`INTERNAL_WORKER_WEB_HMAC_KEY`/`INTERNAL_WEB_BASE_URL` (its only way to
+reach Selcom, indirectly, via web). `infinity-radius-beat` holds neither
+Selcom nor Resend credentials — it only ever schedules the task by name,
+never executes its body — plus none of `SUPABASE_SECRET_KEY`/
+`SUPER_ADMIN_REVIEW_EMAIL`/`NETWORK_AGENT_*` either.
 
 **Selcom provider balance** — `POST /admin/diagnostics/selcom-business/
 provider-balance` (SUPER_ADMIN only) exposes developer.selcom.business's
@@ -602,8 +608,9 @@ API.
 
 ### Network model — which service needs which Selcom whitelist
 
-Every real `SelcomBusinessClient` call site, by runtime (there is no
-hidden Beat call anywhere in this codebase):
+**Option B is implemented (live-verified in sandbox).** The Celery worker
+no longer calls Selcom directly for anything — every real
+`SelcomBusinessClient` call site now runs only in the web/backend process:
 
 | Call site | Method | Operation | Runtime |
 |---|---|---|---|
@@ -611,151 +618,120 @@ hidden Beat call anywhere in this codebase):
 | `admin_diagnostics.py` | `selcom_provider_balance` | `balance` | web (SUPER_ADMIN diagnostic) |
 | `payouts.py` | `preview_lookup` | `account/lookup` | web (tenant preview, read-only) |
 | `payouts.py` | `_submit_to_selcom` | `account/lookup` + `transaction/process` | web only (`confirm_two_factor`, `approve_withdrawal`) — the only path that can move money |
-| `payouts.py` | `_reconcile_locked` | `transaction/query` | web (webhook, manual `/requery`) **and** worker (the scheduled `reconcile_pending_withdrawals` Celery task) |
+| `payouts.py` | `_reconcile_locked` (via `reconcile_withdrawal` or the new `reconcile_if_pending`) | `transaction/query` | web only — reached by the disbursement webhook, the Super Admin manual `/requery`, **and** `app/api/v1/internal_disbursements.py` (the worker's only path to Selcom, over an internal HMAC-authenticated request) |
 
 `infinity-radius-beat` never imports `SelcomBusinessClient` — it only
-schedules the task by name onto Redis; the task body (and any Selcom call
-inside it) only ever executes in the worker process.
+schedules the task by name onto Redis. `infinity-radius-worker` no longer
+imports it either (see `app/tasks/reconciliation.py`'s module docstring
+and `tests/test_reconciliation_task.py::test_reconciliation_module_never_
+imports_selcom_business`, a structural test asserting this at the AST
+level, not just by convention):
+
+```
+Before: web → Selcom; worker → Selcom
+After:  web → Selcom; worker → internal HMAC-authenticated endpoint → web → Selcom
+```
+
+The worker still owns "which withdrawal needs reconciling and when"
+(`PayoutService.list_reconcilable_withdrawals`, a pure DB read) and still
+runs the stale-alert check (`maybe_alert_stale`, pure DB + Resend) — only
+the actual outbound HTTP call to Selcom moved into web/backend.
+
+**Internal worker → web authentication** (`app/core/internal_auth.py`,
+`app/api/v1/internal_disbursements.py`, `app/integrations/internal_web/
+client.py`):
+
+- Route: `POST /api/v1/internal/disbursements/reconcile`, body
+  `{"withdrawal_id": "<uuid>"}` only — no `transId`, amount, destination,
+  or force-flag ever comes from the worker. Response is equally minimal:
+  `{"withdrawal_id", "status", "reconciled"}` — no credentials, no
+  signature, no raw provider payload.
+- Auth: a dedicated HMAC-SHA256 scheme, never the tenant JWT, never the
+  Super Admin JWT, and never Railway private networking alone (a request
+  reaching this route by hostname is not by itself proof of identity — the
+  signature is checked regardless of network path). Canonical string:
+  `timestamp\nnonce\nMETHOD\npath\nsha256(body)`, the same convention
+  `app/integrations/network_agent/signing.py` already uses for Railway →
+  VPS signing, but with its own dedicated secret
+  (`INTERNAL_WORKER_WEB_HMAC_KEY`) — never shared with that or any other
+  integration's key.
+- Replay protection: a 90-second default timestamp tolerance
+  (`INTERNAL_REQUEST_MAX_SKEW_SECONDS`) plus a per-request nonce, checked
+  atomically against Redis (`SET NX EX`) so a stolen/replayed signed
+  request — even one that's still inside the timestamp window — is
+  rejected the second time it's used. Constant-time signature comparison
+  (`hmac.compare_digest`) throughout.
+- Authorization logic lives in `PayoutService.reconcile_if_pending`
+  (reused by nothing else duplicating its provider-status-mapping code):
+  loads the withdrawal, reconciles (queries Selcom) only if it's still
+  `PROCESSING`/`AMBIGUOUS`, and is a safe no-op — no Selcom call at all —
+  for any terminal status. `transaction/process` is structurally
+  unreachable from this path; `test_internal_disbursements.py` asserts a
+  0 call-count for it on every scenario, not just the happy path.
+- Transport: worker reaches web over Railway private networking
+  (`INTERNAL_WEB_BASE_URL`, the web service's actual `RAILWAY_PRIVATE_
+  DOMAIN`-based URL — see Environment variables below), but that's a
+  transport choice, not the security boundary; the HMAC check runs
+  regardless of whether the route happens to also be technically reachable
+  publicly (no CORS is configured for it, and it is never called by any
+  browser-facing code).
 
 **Static Outbound IPs — live-reconfirmed via `railway outbound-network
 static-ip status`, not assumed:**
 
 - `infinity-radius` (web): enabled, `208.77.244.241`, `152.55.184.241`,
-  `152.55.185.190`
-- `infinity-radius-worker`: enabled (was found **disabled** during this
-  task — only the web service had it — and has since been enabled, then
-  redeployed so the change actually took effect on outbound traffic).
-  **Its IPs are a different set from web's**, not a copy:
+  `152.55.185.190` — the ONLY IPs Selcom ever sees traffic from now.
+- `infinity-radius-worker`: still enabled (left as-is; disabling it is an
+  operator decision, not automated by this change) — but **no longer
+  required for Selcom whitelisting**. Its addresses, for reference only:
   `208.77.244.240`, `152.55.184.240`, `152.55.185.189`.
 - `infinity-radius-beat`: not needed and not enabled — it makes no Selcom
-  calls.
+  calls, and never did.
 
-**This is Case B** (worker ≠ web IP set) — the Disbursement whitelist
-must include all 6 addresses, not 3. Deduplicate only if a future Railway
-change happens to make them equal.
-
-| Service | Selcom usage | Static IP required | Collection whitelist | Disbursement whitelist |
+| Service | Selcom usage | Static IP required for Selcom | Collection whitelist | Disbursement whitelist |
 |---|---|---|---|---|
 | `infinity-radius` | Collection (future) + Disbursement | Yes | Yes | Yes |
-| `infinity-radius-worker` | Disbursement reconciliation/query only | Yes | No | Yes |
+| `infinity-radius-worker` | None (asks web via internal HMAC endpoint) | **No** | No | **No** |
 | `infinity-radius-beat` | None | No | No | No |
 | Vercel (frontend) | None | No | No | No |
 | DigitalOcean Network VPS | None (Selcom is never reached from there) | No | No | No |
 
 **Collection whitelist** (future — Collection API is not implemented in
 this codebase): web/backend IPs only — `208.77.244.241`, `152.55.184.241`,
-`152.55.185.190`. Never worker's, unless Collection processing is ever
-moved there (it isn't).
+`152.55.185.190`.
 
-**Disbursement whitelist** (current, real): the union of both sets — all
-6 addresses: `208.77.244.241`, `152.55.184.241`, `152.55.185.190`,
-`208.77.244.240`, `152.55.184.240`, `152.55.185.189`.
+**Disbursement whitelist (final, current, real)**: web's 3 IPs only —
+`208.77.244.241`, `152.55.184.241`, `152.55.185.190`. **Worker's IPs
+(`208.77.244.240`, `152.55.184.240`, `152.55.185.189`) are explicitly NOT
+required for any Selcom whitelist after this change** — they were only
+ever needed under the pre-Option-B architecture. Collection and
+Disbursement whitelists are now identical, comfortably inside Selcom
+sandbox's observed 5-IP whitelist cap (the concrete constraint that
+motivated implementing Option B — see history below).
 
-**A real, discovered constraint**: Selcom's sandbox disbursement app's
-whitelist UI caps out at **5 IP addresses** — one short of the 6 needed.
-Recommendation for sandbox (adopted): use the portal's "Continue without
-IP whitelisting" option rather than arbitrarily dropping one of worker's
-three HA-rotated addresses (Railway's static IP is high-availability and
-rotates traffic across all three unpredictably, so whitelisting only 2 of
-3 would cause intermittent, hard-to-diagnose rejections — worse than no
-whitelist for a sandbox with no real money at stake). Sandbox traffic was
-never observed being IP-rejected even before worker had a static IP at
-all, consistent with sandbox not enforcing this strictly. **This same cap
-may exist on the production portal and must be resolved properly (fewer
-static IPs, or a limit increase from Selcom) before relying on IP
-whitelisting for real money — "continue without whitelisting" is not an
-acceptable production posture.**
-
-**If Railway ever changes these static IPs** (networking reconfiguration,
+**If Railway ever changes web's static IPs** (networking reconfiguration,
 service recreation, IP reallocation) — re-run `railway outbound-network
-static-ip status` against both `infinity-radius` and
-`infinity-radius-worker` and update whichever Selcom whitelist(s) are
-active BEFORE relying on that service for provider calls again. Never
-treat a previously-documented IP list as permanent.
+static-ip status` against `infinity-radius` and update the Selcom
+whitelist(s) BEFORE relying on it for provider calls again. Worker's IPs
+no longer need tracking for this purpose at all.
 
-### Production IP whitelist capacity — decision gate (not yet resolved)
+### History: why Option B was implemented (decision gate, now resolved)
 
-Selcom's sandbox portal caps whitelist entries at 5 IPs; the real
-architecture needs 6 (web's 3 + worker's 3, a genuinely different set —
-see above). **No production activation may proceed until one of the two
-options below is explicitly selected by the operator** — sandbox keeps
-working today via "continue without whitelisting," which is not available
-as a real answer for production.
+Selcom's sandbox portal caps whitelist entries at 5 IPs. Before Option B,
+the architecture needed 6 (web's 3 + worker's 3, a genuinely different,
+non-overlapping set) — one short of the cap. Two options were evaluated:
 
-**OPTION A — Preferred: ask Selcom to raise the limit.** Keep the current
-architecture (web + worker both call Selcom directly) exactly as-is.
-Operator-ready support message, ready to send, no credentials included:
+- **Option A** — ask Selcom to raise the production whitelist limit and
+  keep both web and worker calling Selcom directly. Never pursued; not
+  needed once Option B proved sufficient.
+- **Option B** (chosen and implemented) — centralize all Selcom egress in
+  web/backend; worker asks web via an internal HMAC-authenticated
+  endpoint instead of calling Selcom itself. See "Network model" above
+  for the implemented design.
 
-> **Subject: Production API IP Whitelist Capacity Request**
->
-> Infinity Radius will use Selcom Business APIs (Collection and
-> Disbursement) from a backend hosted on Railway. Our web/API service has
-> 3 static outbound IPv4 addresses, and a separate reconciliation worker
-> service has 3 different static outbound IPv4 addresses — all six can
-> legitimately originate authenticated provider requests as part of normal
-> high-availability operation (Railway rotates traffic across a service's
-> assigned addresses).
->
-> Could you confirm:
-> 1. Can the production API whitelist capacity be increased to 6 or more
->    entries?
-> 2. Is the whitelist scoped per credential/application, or account-wide?
-> 3. Can Collection and Disbursement use separate API applications/
->    credentials, each with its own whitelist?
-> 4. If so, can we register Collection against 3 IPs and Disbursement
->    against all 6 as separate applications?
->
-> The 6 addresses we'd need whitelisted for Disbursement:
-> `208.77.244.241`, `152.55.184.241`, `152.55.185.190` (web/API service)
-> and `208.77.244.240`, `152.55.184.240`, `152.55.185.189` (reconciliation
-> worker service).
-
-If Selcom confirms separate applications/credentials are possible:
-Collection's application/credential only ever needs web's 3 IPs;
-Disbursement's needs all 6 (or, if Option B below is adopted instead,
-Disbursement also drops to needing only web's 3). This is a real
-provider-architecture question this codebase cannot answer on its own —
-included explicitly in the message above rather than assumed.
-
-**OPTION B — Fallback: centralize Selcom egress in web/backend only,**
-if Selcom confirms the limit cannot exceed 5. **Not implemented — design
-only, per this task's explicit scope.**
-
-- The worker would stop instantiating `SelcomBusinessClient` / calling
-  Selcom directly for reconciliation. Instead: Beat → Redis → Worker
-  (unchanged — still finds PROCESSING/AMBIGUOUS rows and decides when a
-  query is due) → a new **internal, service-to-service-authenticated**
-  reconciliation request → `infinity-radius` web/backend → Selcom
-  `transaction/query`.
-- That internal operation may perform **only** `transaction/query` against
-  the withdrawal's existing `idempotency_key`/`transId` — never
-  `transaction/process`, never a new `transId`, never a destination/amount
-  change, never a ledger-state-machine bypass. It would call exactly the
-  same `PayoutService.reconcile_withdrawal` path the webhook and
-  `/requery` already use today — the state-machine/idempotency guarantees
-  described throughout this document are unaffected either way.
-- **Security**: never a public unauthenticated endpoint, never a tenant
-  JWT, never reachable from a browser client. Preferred: Railway private
-  networking (`RAILWAY_PRIVATE_DOMAIN`, already present on every service —
-  see the env var list above) combined with a dedicated internal
-  HMAC-signed request (a fresh, short-lived signature per call, verified
-  server-side) — the same pattern already used for router-token signing
-  and Network Agent authentication in this codebase (`app/core/security.py`
-  equivalents), never network location alone.
-- **Worker's role is unchanged in substance** — it still owns "which
-  withdrawal needs reconciling and when"; only the actual outbound HTTP
-  call to Selcom moves into web/backend. Provider credentials
-  (`SELCOM_BUSINESS_API_KEY`, `SELCOM_BUSINESS_PRIVATE_KEY_B64`) would no
-  longer need to exist on `infinity-radius-worker` at all — a genuine
-  least-privilege improvement: one fewer service holding the ability to
-  sign requests to a payment provider.
-- **Resulting IP requirement**: both Collection and Disbursement whitelists
-  become identical — web's 3 IPs only (`208.77.244.241`, `152.55.184.241`,
-  `152.55.185.190`) — comfortably inside the observed 5-IP sandbox cap.
-
-**Neither option has been activated.** Current architecture (web + worker
-both calling Selcom directly) remains exactly as it is; worker's Static
-Outbound IP stays enabled and healthy while this decision is pending.
+This section is kept for historical context only — the decision is
+resolved, Option B is implemented, and the whitelist requirement above
+("Network model") is the current, authoritative answer.
 
 **Custom API domain** — none exists yet; the public backend URL remains
 `https://infinity-radius-production.up.railway.app` (used as-is for the
@@ -768,22 +744,22 @@ has been run; `SELCOM_BUSINESS_ENVIRONMENT` remains `sandbox` and
 
 1. Obtain real production Selcom Business credentials (API key, RSA
    private key, account number) from Selcom.
-2. Re-check Railway's *current* static outbound IPs for BOTH
-   `infinity-radius` AND `infinity-radius-worker` (see above — do not
-   trust the list printed here without re-verifying; they are a
-   different set from each other, not a copy).
-3. Whitelist the union of both services' IPs (currently 6 addresses) in
-   the production Selcom disbursement application. **If the production
-   portal has the same 5-IP cap the sandbox portal does, resolve that
-   properly first** (request a limit increase from Selcom, or reduce to
-   fewer static IPs per service) — do not fall back to "continue without
-   whitelisting" for production; that is a sandbox-only accommodation.
+2. Re-check Railway's *current* static outbound IPs for `infinity-radius`
+   (web) only — do not trust the list printed here without re-verifying.
+   `infinity-radius-worker`'s IPs are NOT needed for this (Option B —
+   see "Network model" above); do not whitelist them.
+3. Whitelist web's 3 IPs in the production Selcom disbursement
+   application. **This is already comfortably inside the 5-IP cap the
+   sandbox portal shows** — still worth confirming the production portal's
+   own limit, but "continue without whitelisting" is a sandbox-only
+   accommodation and should not be relied on for production regardless.
 4. Configure the production callback URL in the Selcom portal (same path,
    `/api/v1/webhooks/selcom-business/disbursement`, against the real
    production backend URL).
-5. Enter production credentials directly into Railway Variables on
-   `infinity-radius` and `infinity-radius-worker` — never GitHub, Vercel,
-   frontend, docs, chat, or logs.
+5. Enter production Selcom credentials directly into Railway Variables on
+   `infinity-radius` (web) only — `infinity-radius-worker` does not need
+   them and should not receive them. Never GitHub, Vercel, frontend, docs,
+   chat, or logs.
 6. Verify the environment/base-URL pairing
    (`SELCOM_BUSINESS_ENVIRONMENT=production` with the real
    `https://api.selcom.business` base URL) — `validate_selcom_startup_config`
@@ -847,8 +823,12 @@ Selcom is never called. Neither has been executed as part of this task.
 - [ ] Selcom production credentials configured (Railway only)
 - [ ] Production base URL correct and environment-paired
   (`validate_selcom_startup_config` passing)
-- [ ] Railway's *current* static outbound IPs whitelisted in the
-  production Selcom portal (re-check — don't trust a historical list)
+- [ ] `infinity-radius` (web)'s *current* static outbound IPs whitelisted
+  in the production Selcom portal (re-check — don't trust a historical
+  list; worker's IPs are not needed, see "Network model" above)
+- [ ] `INTERNAL_WORKER_WEB_HMAC_KEY` set on both `infinity-radius` and
+  `infinity-radius-worker`, and `INTERNAL_WEB_BASE_URL` set on
+  `infinity-radius-worker` to web's real Railway private URL
 - [ ] Production callback configured in the Selcom portal
 - [ ] Backend (`infinity-radius`), Worker, Beat, Redis, Supabase, Resend
   all healthy

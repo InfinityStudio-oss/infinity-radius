@@ -7,6 +7,7 @@ from app.api.v1.audit import router as audit_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.customers import router as customers_router
 from app.api.v1.dashboard import router as dashboard_router
+from app.api.v1.internal_disbursements import router as internal_disbursements_router
 from app.api.v1.locations import router as locations_router
 from app.api.v1.onboarding import router as onboarding_router
 from app.api.v1.packages import router as packages_router
@@ -59,6 +60,12 @@ api_router.include_router(
 # --- Inbound payment-provider callbacks (no Supabase auth — see
 # app/api/v1/webhooks.py for how authenticity is established instead) ----
 api_router.include_router(webhooks_router, prefix="/webhooks", tags=["webhooks"])
+
+# --- Internal service-to-service only (Celery worker -> web), HMAC-authenticated
+# — never a tenant or Super Admin JWT. See app/core/internal_auth.py. ----
+api_router.include_router(
+    internal_disbursements_router, prefix="/internal", tags=["internal"]
+)
 
 # --- Earlier-phase surfaces, kept for the dashboard shell's existing calls --
 # (generic not_configured placeholders for resources not yet listed above;

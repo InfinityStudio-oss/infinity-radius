@@ -1079,6 +1079,27 @@ class PayoutService:
         await self._reconcile_locked(withdrawal, actor_id=None)
         return withdrawal
 
+    async def reconcile_if_pending(self, *, withdrawal_id: UUID) -> tuple[Withdrawal, bool]:
+        """Guarded entry point for app/api/v1/internal_disbursements.py (the
+        worker's only path to Selcom, via the internal HMAC endpoint) —
+        queries Selcom only when the withdrawal is still PROCESSING or
+        AMBIGUOUS, and is a safe no-op for any terminal status (SUCCESS,
+        FAILED, etc.), never re-querying a withdrawal reconciliation can no
+        longer affect. Reuses _reconcile_locked (same lock, same
+        provider-status-mapping code as reconcile_withdrawal/the webhook
+        path) rather than duplicating any of it. Returns (withdrawal,
+        reconciled) — reconciled is False whenever no Selcom call was made."""
+        withdrawal = await self.repo.get_by_id_for_update(tenant_id=None, id=withdrawal_id)
+        if withdrawal is None:
+            raise NotFoundError("Withdrawal not found")
+        if withdrawal.status not in (
+            WithdrawalStatus.PROCESSING.value,
+            WithdrawalStatus.AMBIGUOUS.value,
+        ):
+            return withdrawal, False
+        await self._reconcile_locked(withdrawal, actor_id=None)
+        return withdrawal, True
+
     async def list_reconcilable_withdrawals(self) -> list[Withdrawal]:
         """Every withdrawal a periodic reconciliation sweep should query —
         PROCESSING (awaiting a first authoritative result) or AMBIGUOUS

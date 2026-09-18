@@ -1,20 +1,23 @@
 """Celery application shared by the API (task producer) and the worker/beat
-processes (apps/worker), which import this module to obtain the same
-broker/backend configuration and task registry.
+processes, which import this module to obtain the same broker/backend
+configuration and task registry.
+
+Neither Worker nor Beat calls Selcom directly (Option B network
+centralization — see app/integrations/internal_web/client.py and
+app/api/v1/internal_disbursements.py): Beat only schedules, and Worker
+only decides which withdrawals need reconciliation and asks web's
+internal HMAC-authenticated endpoint to actually query Selcom. So this
+module deliberately never imports or calls
+app.integrations.selcom_business.config.validate_selcom_startup_config —
+Worker/Beat boot with zero Selcom credentials/awareness; only app/main.py
+(the web service) still validates them at startup.
 """
 
 from celery import Celery
 
 from app.core.config import get_settings
-from app.integrations.selcom_business.config import validate_selcom_startup_config
 
 settings = get_settings()
-
-# Same guard as app/main.py — a no-op when Selcom isn't configured at all
-# (Beat's case, by design: it never calls Selcom, only schedules), but
-# catches a real sandbox/production mismatch immediately on Worker boot,
-# which does call Selcom (reconciliation queries).
-validate_selcom_startup_config()
 
 celery_app = Celery(
     "infinity_radius",
