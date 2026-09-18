@@ -6,8 +6,15 @@ broker/backend configuration and task registry.
 from celery import Celery
 
 from app.core.config import get_settings
+from app.integrations.selcom_business.config import validate_selcom_startup_config
 
 settings = get_settings()
+
+# Same guard as app/main.py — a no-op when Selcom isn't configured at all
+# (Beat's case, by design: it never calls Selcom, only schedules), but
+# catches a real sandbox/production mismatch immediately on Worker boot,
+# which does call Selcom (reconciliation queries).
+validate_selcom_startup_config()
 
 celery_app = Celery(
     "infinity_radius",

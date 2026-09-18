@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 import app.models  # noqa: F401,E402
 from alembic import context
 from app.core.config import get_settings
+from app.core.migration_safety import MigrationBlockedError, guard_migration
 from app.db.base import Base
 
 config = context.config
@@ -20,6 +22,24 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 settings = get_settings()
+
+# Every Alembic invocation — bare CLI, scripts/migrate.py, a Railway
+# migration step — imports this module, so this is the one unavoidable
+# place to enforce this. Runs before set_main_option and before anything
+# ever opens a connection. See app/core/migration_safety.py for why this
+# exists and app/core/config.py for ALLOW_PRODUCTION_MIGRATIONS.
+try:
+    _migration_target = guard_migration(
+        database_url=str(settings.database_url),
+        explicit_target=settings.database_migration_target,
+        allow_production_migrations=settings.allow_production_migrations,
+    )
+except MigrationBlockedError as exc:
+    print(f"\n[migration-safety] {exc}\n", file=sys.stderr)
+    sys.exit(1)
+
+print(f"[migration-safety] migration target classified as: {_migration_target}", file=sys.stderr)
+
 config.set_main_option("sqlalchemy.url", str(settings.database_url))
 
 

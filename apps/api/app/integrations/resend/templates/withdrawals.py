@@ -54,6 +54,49 @@ def admin_withdrawal_review_email(
     return subject, render_email(app_url=app_url, preheader=subject, body_html=body)
 
 
+def stale_withdrawal_alert_email(
+    *,
+    app_url: str,
+    withdrawal_id: UUID,
+    tenant_name: str,
+    amount: Decimal,
+    currency: str,
+    status: str,
+    provider_reference: str | None,
+    stuck_minutes: int,
+) -> tuple[str, str]:
+    """Never a payout-retry prompt — see app/services/payouts.py's
+    reconciliation code, which only ever queries Selcom, never resubmits.
+    This exists purely to get a human looking at a withdrawal reconciliation
+    alone hasn't been able to resolve within the configured threshold."""
+    subject = f"Withdrawal stuck {status} for {stuck_minutes}m — {tenant_name} ({currency} {amount:,.2f})"
+    review_url = f"{app_url}/super-admin/financial/disbursements?withdrawal={withdrawal_id}"
+    rows = [
+        ("Tenant", tenant_name),
+        ("Amount", f"{currency} {amount:,.2f}"),
+        ("Status", status),
+        ("Provider Reference", provider_reference),
+        ("Stuck For", f"{stuck_minutes} minutes"),
+        ("Withdrawal ID", str(withdrawal_id)),
+    ]
+    table_rows = "".join(
+        f'<tr><td style="padding:4px 12px 4px 0;color:#64748b;">{_esc(label)}</td>'
+        f'<td style="padding:4px 0;color:#0f172a;font-weight:500;">{_esc(str(value) if value else None)}</td></tr>'
+        for label, value in rows
+    )
+    body = f"""\
+<p>A withdrawal has remained <strong>{_esc(status)}</strong> for longer than the configured
+alert threshold. The automatic reconciliation sweep has queried Selcom and could not resolve
+it — this needs operator attention.</p>
+<table role="presentation" style="font-size:14px;margin-top:8px;">{table_rows}</table>
+{render_button(href=review_url, label="View Withdrawal")}
+<p style="color:#64748b;font-size:13px;margin-top:16px;">This is a status alert only — no
+payout retry has been or will be triggered automatically. Re-querying the provider is safe;
+resubmitting a transfer is not, and this platform never does so automatically.</p>
+"""
+    return subject, render_email(app_url=app_url, preheader=subject, body_html=body)
+
+
 def withdrawal_otp_email(
     *,
     app_url: str,

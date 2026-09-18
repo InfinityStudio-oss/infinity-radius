@@ -5,12 +5,18 @@ from app.api.v1 import api_router
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
+from app.integrations.selcom_business.config import validate_selcom_startup_config
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIDMiddleware
 
 settings = get_settings()
 
 configure_logging()
+
+# Fails loud at boot on a sandbox/production Selcom credential mismatch —
+# never waits for the first real withdrawal to discover it. No-op if
+# Selcom isn't configured at all yet (a valid, safe "not set up" state).
+validate_selcom_startup_config()
 
 app = FastAPI(
     title=settings.app_name,

@@ -207,3 +207,37 @@ class ResendEmailService:
         # log_context only, never the OTP itself — _send's own failure log
         # only ever includes the Resend error string, never `html`/`otp`.
         return await self._send(to=to, subject=subject, html=html, log_context="withdrawal_otp")
+
+    async def send_stale_withdrawal_alert_email(
+        self,
+        *,
+        withdrawal_id: UUID,
+        tenant_name: str,
+        amount: Decimal,
+        currency: str,
+        status: str,
+        provider_reference: str | None,
+        stuck_minutes: int,
+    ) -> EmailSendResult:
+        if not self._config.super_admin_review_email:
+            return EmailSendResult(
+                sent=False,
+                provider_message_id=None,
+                error_message="SUPER_ADMIN_REVIEW_EMAIL is not configured",
+            )
+        subject, html = withdrawal_templates.stale_withdrawal_alert_email(
+            app_url=self._config.app_url,
+            withdrawal_id=withdrawal_id,
+            tenant_name=tenant_name,
+            amount=amount,
+            currency=currency,
+            status=status,
+            provider_reference=provider_reference,
+            stuck_minutes=stuck_minutes,
+        )
+        return await self._send(
+            to=self._config.super_admin_review_email,
+            subject=subject,
+            html=html,
+            log_context="stale_withdrawal_alert",
+        )

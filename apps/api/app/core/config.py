@@ -34,6 +34,21 @@ class Settings(BaseSettings):
     # --- Primary database (Supabase Postgres) ---
     database_url: PostgresDsn
 
+    # --- Migration safety (see app/core/migration_safety.py, alembic/env.py) ---
+    # A bare `alembic upgrade head` has twice resolved this DATABASE_URL to
+    # the real production Supabase database from a developer's local .env
+    # (whose ENVIRONMENT was "development" — proof ENVIRONMENT alone isn't
+    # a reliable signal). Both migrations happened to be additive/harmless,
+    # but nothing stopped a destructive one. Default False: any
+    # non-localhost DATABASE_URL is refused until this is explicitly set,
+    # only for the one migration command, then unset again.
+    allow_production_migrations: bool = False
+    # Explicit operator override for the rare case the hostname heuristic
+    # in app/core/migration_safety.py gets a database target wrong (e.g. a
+    # future staging host that isn't "localhost" but is genuinely safe).
+    # Never required for normal local/production use.
+    database_migration_target: Literal["local", "test", "staging", "production"] | None = None
+
     # --- RADIUS database (separate Postgres on the Network VPS, FreeRADIUS schema) ---
     radius_database_url: PostgresDsn | None = None
 
@@ -145,11 +160,42 @@ class Settings(BaseSettings):
     # health visibility) — never the tenant wallet balance.
     selcom_business_account_number: str | None = None
 
+    # --- Production payout kill switch (see app/services/payouts.py._submit_to_selcom) ---
+    # A THIRD, independent gate on top of selcom_business_environment and
+    # selcom_disbursement_enabled — a real production disbursement requires
+    # ALL THREE: environment=production AND disbursement_enabled=true AND
+    # this. Defaults False so flipping environment to "production" alone
+    # (or even that plus disbursement_enabled) is never, by itself, enough
+    # to move real money — this must be turned on deliberately, separately,
+    # only when an operator is actually ready for the first real payout.
+    selcom_production_payouts_enabled: bool = False
+
     # --- Withdrawal approval threshold (see app/services/payouts.py) ---
     # amount <= this: no Super Admin approval, proceeds straight to Selcom
     # once 2FA confirms. amount > this: PENDING_APPROVAL until a SUPER_ADMIN
     # approves or rejects it. Server-side only — never a frontend control.
     selcom_withdrawal_approval_threshold_tzs: Decimal = Decimal("100000")
+
+    # --- Withdrawal safety limits (see app/services/payouts.py) ---
+    # No product/business policy has been decided on these yet — every
+    # limit defaults to None (disabled/unenforced) so this platform's
+    # actual behavior doesn't silently change until an operator makes a
+    # real decision and sets a value. The enforcement code exists and is
+    # tested now so activating a limit later needs only a Railway
+    # variable, not a deploy.
+    withdrawal_min_amount_tzs: Decimal | None = None
+    withdrawal_max_single_amount_tzs: Decimal | None = None
+    withdrawal_daily_limit_tzs: Decimal | None = None
+    withdrawal_daily_count_limit: int | None = None
+
+    # --- Stale withdrawal alerting (see app/tasks/reconciliation.py) ---
+    # A withdrawal that's been PROCESSING or AMBIGUOUS for longer than
+    # this is almost certainly stuck waiting on a human, not the next
+    # Beat sweep — alert once, then respect the cooldown rather than
+    # re-alerting every 120s while it stays unresolved.
+    withdrawal_processing_alert_minutes: int = 30
+    withdrawal_ambiguous_alert_minutes: int = 15
+    withdrawal_stale_alert_cooldown_minutes: int = 60
 
     # --- Withdrawal OTP (see app/services/two_factor.py) ---
     # HMAC key for hashing withdrawal OTPs — a small (6-digit) keyspace

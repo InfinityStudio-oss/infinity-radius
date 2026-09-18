@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.enums import LedgerEntryType, TenantStatus, WithdrawalStatus
+from app.models.audit import AuditLog
 from app.models.finance import LedgerEntry, PaymentWebhook, Withdrawal
 from app.models.network import Router, UserSession
 from app.models.tenancy import Tenant
@@ -51,6 +52,26 @@ class SuperAdminSummary:
     pending_payouts: int
     pending_payouts_amount_tzs: Decimal
     failed_webhooks: int
+
+
+@dataclass(frozen=True)
+class ReconciliationHealth:
+    """Derived entirely from the audit trail (the most recent
+    "withdrawal.reconciliation_swept" row app/tasks/reconciliation.py
+    writes every Beat cycle) plus a live count — no separate table, no
+    provider secret, no Railway/Celery infrastructure query. `last_run_at`
+    being recent is the real signal that Beat+Worker are alive and
+    actually executing the sweep, not just deployed."""
+
+    last_run_at: dt.datetime | None
+    minutes_since_last_run: float | None
+    last_scanned: int | None
+    last_resolved: int | None
+    last_still_pending: int | None
+    last_failed: int | None
+    last_alerted: int | None
+    currently_processing: int
+    currently_ambiguous: int
 
 
 class SuperAdminDashboardService:
@@ -197,6 +218,48 @@ class SuperAdminDashboardService:
             )
             for withdrawal_id, tenant_name, amount, status, requested_at in result.all()
         ]
+
+    async def reconciliation_health(self) -> ReconciliationHealth:
+        row = (
+            await self.db.execute(
+                select(AuditLog.created_at, AuditLog.log_metadata)
+                .where(AuditLog.action == "withdrawal.reconciliation_swept")
+                .order_by(AuditLog.created_at.desc())
+                .limit(1)
+            )
+        ).first()
+
+        last_run_at: dt.datetime | None = None
+        minutes_since: float | None = None
+        metadata: dict[str, Any] = {}
+        if row is not None:
+            last_run_at, metadata = row
+            metadata = metadata or {}
+            reference = last_run_at if last_run_at.tzinfo else last_run_at.replace(tzinfo=dt.UTC)
+            minutes_since = (dt.datetime.now(dt.UTC) - reference).total_seconds() / 60
+
+        processing_count = await self._count(
+            select(func.count(Withdrawal.id)).where(
+                Withdrawal.status == WithdrawalStatus.PROCESSING.value
+            )
+        )
+        ambiguous_count = await self._count(
+            select(func.count(Withdrawal.id)).where(
+                Withdrawal.status == WithdrawalStatus.AMBIGUOUS.value
+            )
+        )
+
+        return ReconciliationHealth(
+            last_run_at=last_run_at,
+            minutes_since_last_run=minutes_since,
+            last_scanned=metadata.get("scanned"),
+            last_resolved=metadata.get("resolved"),
+            last_still_pending=metadata.get("still_pending"),
+            last_failed=metadata.get("failed"),
+            last_alerted=metadata.get("alerted"),
+            currently_processing=processing_count,
+            currently_ambiguous=ambiguous_count,
+        )
 
     async def _count(self, stmt: Select[Any]) -> int:
         result = await self.db.execute(stmt)

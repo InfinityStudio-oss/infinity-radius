@@ -78,3 +78,24 @@ async def reject_withdrawal(
     )
     await db.commit()
     return ApiResponse(data=WithdrawalRead.model_validate(withdrawal))
+
+
+@router.post("/{withdrawal_id}/requery", response_model=ApiResponse[WithdrawalRead])
+async def requery_withdrawal(
+    withdrawal_id: UUID,
+    user: AuthenticatedUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[WithdrawalRead]:
+    """The ONE safe manual action for a PROCESSING/AMBIGUOUS withdrawal —
+    an authenticated GET /v1/transaction/query against Selcom with this
+    withdrawal's own idempotency_key, exactly what the periodic Beat sweep
+    and the disbursement webhook both already do (see
+    PayoutService.reconcile_withdrawal). There is deliberately no
+    "resubmit"/"resend payout" action anywhere in this API — manually
+    retrying transaction/process is never safe and this platform never
+    exposes a way to do it. Useful when an operator wants an immediate
+    answer instead of waiting up to 120s for the next scheduled sweep."""
+    service = PayoutService(db)
+    withdrawal = await service.reconcile_withdrawal(withdrawal_id=withdrawal_id)
+    await db.commit()
+    return ApiResponse(data=WithdrawalRead.model_validate(withdrawal))

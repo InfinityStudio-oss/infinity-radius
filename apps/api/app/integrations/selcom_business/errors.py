@@ -14,6 +14,15 @@ class SelcomBusinessNotConfiguredError(SelcomBusinessError):
     """SELCOM_BUSINESS_BASE_URL/API_KEY/PRIVATE_KEY_B64 not set."""
 
 
+class SelcomBusinessMisconfiguredError(SelcomBusinessError):
+    """SELCOM_BUSINESS_BASE_URL doesn't match SELCOM_BUSINESS_ENVIRONMENT
+    (e.g. a sandbox base URL with environment=production, or vice versa) —
+    distinct from simply not being configured at all. Never proceeds with
+    a request under this condition: sandbox credentials must never reach
+    a production URL, and production credentials must never accidentally
+    stay pointed at sandbox."""
+
+
 class SelcomBusinessTransportError(SelcomBusinessError):
     """The HTTP request itself failed (timeout, connection error, DNS,
     TLS) — distinct from a request that reached Selcom and got an error

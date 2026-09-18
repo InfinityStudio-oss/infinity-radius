@@ -1,6 +1,8 @@
+from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models.finance import (
     LedgerEntry,
@@ -92,6 +94,32 @@ class WithdrawalRepository(BaseRepository[Withdrawal]):
         """Every withdrawal currently awaiting SUPER_ADMIN review — the
         Super Admin withdrawal queue's "Pending Approval" tab."""
         return await self.list_by_statuses(statuses=["PENDING_APPROVAL"])
+
+    # Excluded from daily-limit totals: CANCELLED/REJECTED never actually
+    # disbursed or even held a lasting reservation past the moment they
+    # were voided, and FAILED released its reservation back — counting
+    # them would needlessly restrict a tenant who simply hit a mistake or
+    # a provider hiccup earlier in the day. Every other status (including
+    # DRAFT — it's holding a live reservation right now) counts.
+    _DAILY_LIMIT_EXCLUDED_STATUSES = ("CANCELLED", "REJECTED", "FAILED")
+
+    async def daily_totals(
+        self, *, tenant_id: UUID, since: datetime
+    ) -> tuple[Decimal, int]:
+        """(sum_amount, count) of this tenant's withdrawals requested at
+        or after `since` (a UTC day boundary — see
+        app/services/payouts.py._enforce_withdrawal_limits) that count
+        toward WITHDRAWAL_DAILY_LIMIT_TZS/WITHDRAWAL_DAILY_COUNT_LIMIT."""
+        stmt = select(
+            func.coalesce(func.sum(Withdrawal.amount), 0), func.count(Withdrawal.id)
+        ).where(
+            Withdrawal.tenant_id == tenant_id,
+            Withdrawal.created_at >= since,
+            Withdrawal.status.not_in(self._DAILY_LIMIT_EXCLUDED_STATUSES),
+        )
+        result = await self.db.execute(stmt)
+        total, count = result.one()
+        return Decimal(total), int(count)
 
 
 class WithdrawalEventRepository(BaseRepository[WithdrawalEvent]):

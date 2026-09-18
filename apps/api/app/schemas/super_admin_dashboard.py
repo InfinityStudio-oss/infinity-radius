@@ -39,3 +39,20 @@ class PendingPayoutRow(BaseModel):
     amount_tzs: Money
     status: str
     requested_at: datetime
+
+
+class ReconciliationHealthRead(BaseModel):
+    """See app/services/super_admin_dashboard.py.reconciliation_health —
+    entirely derived from the audit trail plus a live count. A recent
+    last_run_at is the real signal that Celery Beat/Worker are alive and
+    actually executing the reconciliation sweep."""
+
+    last_run_at: datetime | None
+    minutes_since_last_run: float | None
+    last_scanned: int | None
+    last_resolved: int | None
+    last_still_pending: int | None
+    last_failed: int | None
+    last_alerted: int | None
+    currently_processing: int
+    currently_ambiguous: int

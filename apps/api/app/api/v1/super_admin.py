@@ -23,6 +23,7 @@ from app.schemas.dashboard import CollectionsTrendPoint
 from app.schemas.envelope import ApiListResponse, ApiResponse
 from app.schemas.super_admin_dashboard import (
     PendingPayoutRow,
+    ReconciliationHealthRead,
     SuperAdminSummaryRead,
     TenantGrowthPoint,
 )
@@ -145,6 +146,31 @@ async def get_pending_payouts_queue(
 ) -> ApiResponse[list[PendingPayoutRow]]:
     rows = await SuperAdminDashboardService(db).pending_payouts_queue()
     return ApiResponse(data=rows)
+
+
+@router.get("/reconciliation-health", response_model=ApiResponse[ReconciliationHealthRead])
+async def get_reconciliation_health(
+    user: AuthenticatedUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[ReconciliationHealthRead]:
+    """Safe operational visibility into the Celery Beat/Worker
+    reconciliation sweep — see app/tasks/reconciliation.py and
+    app/services/super_admin_dashboard.py.reconciliation_health. Never
+    exposes a provider secret or credential."""
+    health = await SuperAdminDashboardService(db).reconciliation_health()
+    return ApiResponse(
+        data=ReconciliationHealthRead(
+            last_run_at=health.last_run_at,
+            minutes_since_last_run=health.minutes_since_last_run,
+            last_scanned=health.last_scanned,
+            last_resolved=health.last_resolved,
+            last_still_pending=health.last_still_pending,
+            last_failed=health.last_failed,
+            last_alerted=health.last_alerted,
+            currently_processing=health.currently_processing,
+            currently_ambiguous=health.currently_ambiguous,
+        )
+    )
 
 
 @router.get("/audit-logs", response_model=ApiListResponse[AuditLogRead])

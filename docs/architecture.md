@@ -98,6 +98,78 @@ psql -U postgres -h localhost -c "DROP ROLE IF EXISTS radius_app;"
 python -m scripts.setup_local_radius_db
 ```
 
+## Migration Safety
+
+**Never run a bare `alembic upgrade head` against production without
+explicit operator authorization — and now you don't have to worry about
+doing so by accident.** Two prior incidents had a bare `alembic upgrade
+head`, run locally, resolve `DATABASE_URL` to the real production
+Supabase database — even though the same `.env`'s `ENVIRONMENT` said
+"development". Both migrations happened to be additive/harmless, but
+nothing actually stopped a destructive one. That's now enforced in code —
+see `app/core/migration_safety.py` and `alembic/env.py` (the one path
+every Alembic invocation goes through, bare CLI included, so there is no
+way to bypass this by skipping a wrapper script).
+
+**How target classification works** (`classify_database_target`):
+`DATABASE_URL`'s hostname is the primary signal — `localhost`/`127.0.0.1`
+classifies as `local`, anything else classifies as `production` by
+default. `ENVIRONMENT` is deliberately *not* trusted alone (it's exactly
+what lied in both incidents). `Settings.database_migration_target` is an
+explicit escape hatch for the rare case a genuinely-safe non-localhost
+target (e.g. a future staging host) needs to be named directly.
+
+**The gate**: any target other than `local`/`test` requires
+`ALLOW_PRODUCTION_MIGRATIONS=true` (`Settings.allow_production_migrations`,
+default `false`). Without it, `alembic/env.py` raises
+`MigrationBlockedError` and exits non-zero *before* anything opens a
+database connection — no partial migration, no accidental write. The
+error message names the classification, never the connection string,
+host, database name, or credential.
+
+### LOCAL — migrating your own dev database
+
+Nothing special — `DATABASE_URL` in `apps/api/.env` should already point
+at your local Postgres, so:
+
+```bash
+alembic upgrade head
+# or, equivalently:
+python -m scripts.migrate upgrade head
+```
+
+### TEST — how the test suite handles migrations
+
+`tests/conftest.py` pins `DATABASE_URL` to local Postgres via
+`os.environ.setdefault` before any app module imports, overriding
+whatever a real `.env` has — the test suite can never touch production no
+matter what's locally configured. Apply migrations to the test database
+the same way as LOCAL, once, before running `pytest` (the suite itself
+never runs migrations).
+
+### PRODUCTION — the exact controlled procedure
+
+1. Confirm the migration is genuinely needed and additive where possible
+   (see each existing migration's docstring for the established style).
+2. From a shell with the **real** production `DATABASE_URL` (Railway's
+   own environment, or a local shell with it explicitly exported — never
+   rely on whatever happens to be in a local `.env`):
+   ```bash
+   ALLOW_PRODUCTION_MIGRATIONS=true alembic upgrade head
+   ```
+3. **Immediately unset `ALLOW_PRODUCTION_MIGRATIONS`** afterward — on
+   Railway, remove the variable (or set it back to `false`) right after
+   the migration job finishes. Do not leave it permanently `true` on any
+   service; it should exist only for the duration of the one migration
+   command/job.
+4. Verify with `alembic current` (still requires the same authorization
+   while checking against production — this is read-only but the guard
+   doesn't distinguish read from write, which is the conservative choice).
+
+**Never** run a bare `alembic upgrade head` against production without
+this explicit authorization — that is precisely the mistake this guard
+exists to make structurally impossible.
+
 ## Router communication path
 
 ```
@@ -438,7 +510,130 @@ trusted directly. A periodic Celery Beat task
 (`app/tasks/reconciliation.py`, every 2 minutes, registered on `apps/api`'s
 own `celery_app` — it needs the API's DB/service layer, unlike
 `apps/worker`) sweeps every `PROCESSING`/`AMBIGUOUS` withdrawal the same
-way, as a safety net for a missed or never-sent callback.
+way, as a safety net for a missed or never-sent callback. This endpoint is
+publicly reachable over HTTPS at the Railway URL below with no auth
+required (by design — Selcom can't authenticate to it any other way; the
+re-verification against Selcom's own signed API is what makes that safe),
+and only ever queries, never resubmits, on any input.
+
+The same sweep also runs `PayoutService.maybe_alert_stale` on anything
+still unresolved after the query — ONE Super Admin email (Resend) once a
+withdrawal has been `PROCESSING`/`AMBIGUOUS` past
+`WITHDRAWAL_PROCESSING_ALERT_MINUTES`/`WITHDRAWAL_AMBIGUOUS_ALERT_MINUTES`
+(defaults 30/15), then a `WITHDRAWAL_STALE_ALERT_COOLDOWN_MINUTES` cooldown
+(default 60) before it will alert again — deduplicated via the most recent
+`withdrawal.stale_alert_sent` audit row for that withdrawal, no new table.
+Never a payout-retry prompt; the email is explicit that only re-querying is
+safe. Each sweep also writes one `withdrawal.reconciliation_swept` audit
+row (`scanned`/`resolved`/`still_pending`/`failed`/`alerted` counts) — the
+data behind `GET /api/v1/super-admin/reconciliation-health`, a real,
+credential-free operational-visibility endpoint whose `last_run_at`
+freshness is the actual signal that Beat+Worker are alive and executing,
+not just deployed.
+
+For a `PROCESSING`/`AMBIGUOUS` withdrawal an operator wants resolved right
+now rather than waiting up to 120s, `POST
+/api/v1/admin/withdrawals/{id}/requery` (SUPER_ADMIN only) runs that same
+query-only reconciliation on demand. There is deliberately no
+"resubmit"/"resend payout" action anywhere in this API — manually retrying
+`transaction/process` is never exposed, by design.
+
+### Production hardening (sandbox remains active — see below)
+
+**Sandbox/production separation** — `SelcomBusinessConfig.
+base_url_matches_environment` (`app/integrations/selcom_business/config.py`)
+fails closed (`SelcomBusinessMisconfiguredError`) if
+`SELCOM_BUSINESS_BASE_URL`'s host doesn't match
+`SELCOM_BUSINESS_ENVIRONMENT` — a sandbox host always contains "sandbox";
+production must be exactly `api.selcom.business`. Checked on every real
+request (`require_configured()`) and once at process boot
+(`validate_selcom_startup_config`, called from both `app/main.py` and
+`app/core/celery_app.py`) so a mismatch is caught immediately, not on the
+first real withdrawal.
+
+**Production payout triple gate** — a real disbursement requires ALL
+THREE, independently: `SELCOM_BUSINESS_ENVIRONMENT=production` AND
+`SELCOM_DISBURSEMENT_ENABLED=true` AND `SELCOM_PRODUCTION_PAYOUTS_ENABLED=
+true` (new; defaults `false`). Flipping environment to "production" — even
+together with disbursement_enabled — is never, by itself, enough to submit
+a real payout; see `PayoutService._submit_to_selcom`.
+
+**Withdrawal safety limits** (`app/services/payouts.py.
+_enforce_withdrawal_limits`) — `WITHDRAWAL_MIN_AMOUNT_TZS`,
+`WITHDRAWAL_MAX_SINGLE_AMOUNT_TZS`, `WITHDRAWAL_DAILY_LIMIT_TZS`,
+`WITHDRAWAL_DAILY_COUNT_LIMIT` — every one defaults to unset/unenforced
+(no product policy has been decided yet); the enforcement code exists and
+is tested now so activating one later needs only a Railway variable, not a
+deploy. Daily totals use a UTC calendar-day boundary and count every
+withdrawal status except `CANCELLED`/`REJECTED`/`FAILED`
+(`WithdrawalRepository.daily_totals`) — an operator should confirm this
+exact counting policy before relying on it as the final word.
+
+**Environment variable least privilege** — `infinity-radius` (web) and
+`infinity-radius-worker` both hold Selcom/Resend credentials (web submits
+synchronously; worker's reconciliation sweep queries Selcom and now also
+sends stale-alert email). `infinity-radius-beat` holds neither — it only
+ever schedules the task by name, never executes its body — plus none of
+`SUPABASE_SECRET_KEY`/`SUPER_ADMIN_REVIEW_EMAIL`/`NETWORK_AGENT_*` either.
+
+**IP whitelist** — Railway's current static outbound IPs (as of this
+writing) are `208.77.244.241`, `152.55.184.241`, `152.55.185.190`.
+**Before any future production activation, re-check Railway's actual
+current static outbound IPs** (Settings → Networking on the `infinity-
+radius` service) rather than assuming these — Railway can change them, and
+the production Selcom portal must whitelist whatever is current at
+activation time, not this list.
+
+**Custom API domain** — none exists yet; the public backend URL remains
+`https://infinity-radius-production.up.railway.app` (used as-is for the
+disbursement callback). A custom domain can be added later if desired —
+not invented here.
+
+**Production activation runbook — prepared, NOT executed.** No step below
+has been run; `SELCOM_BUSINESS_ENVIRONMENT` remains `sandbox` and
+`SELCOM_PRODUCTION_PAYOUTS_ENABLED` remains `false`.
+
+1. Obtain real production Selcom Business credentials (API key, RSA
+   private key, account number) from Selcom.
+2. Re-check Railway's *current* static outbound IPs (see above — do not
+   trust the list printed here without re-verifying).
+3. Whitelist all current Railway outbound IPs in the production Selcom
+   portal.
+4. Configure the production callback URL in the Selcom portal (same path,
+   `/api/v1/webhooks/selcom-business/disbursement`, against the real
+   production backend URL).
+5. Enter production credentials directly into Railway Variables on
+   `infinity-radius` and `infinity-radius-worker` — never GitHub, Vercel,
+   frontend, docs, chat, or logs.
+6. Verify the environment/base-URL pairing
+   (`SELCOM_BUSINESS_ENVIRONMENT=production` with the real
+   `https://api.selcom.business` base URL) — `validate_selcom_startup_config`
+   will refuse to boot on a mismatch, which is the intended safety net,
+   not a bug to work around.
+7. Keep `SELCOM_PRODUCTION_PAYOUTS_ENABLED=false` initially even after the
+   above — credentials configured with payouts still off is the correct,
+   safe state to verify connectivity from.
+8. If Selcom's API supports a non-money-moving connectivity check (e.g.
+   `account/lookup` against a real but harmless account), run one to
+   confirm signing/auth/IP-whitelist all work before touching the payout
+   gate.
+9. Get explicit operator sign-off that production activation is
+   deliberately intended right now.
+10. Set `SELCOM_PRODUCTION_PAYOUTS_ENABLED=true`.
+11. Perform ONE small, controlled real withdrawal: an internal/owner test
+    tenant, an operator-approved small amount, a verified destination
+    account the operator actually controls, real email OTP, below the
+    100,000 TZS Super Admin threshold unless specifically testing that
+    flow separately, with a Super Admin actively watching logs/dashboard.
+12. Verify end to end: `transaction/process` result, `transaction/query`
+    reconciliation, the callback (if Selcom sends one), ledger entries,
+    the Resend confirmation, and that Celery reconciliation picked it up
+    correctly if it wasn't instant.
+13. If anything doesn't match expectations, set
+    `SELCOM_PRODUCTION_PAYOUTS_ENABLED=false` again immediately — the kill
+    switch is designed to be fast and requires no deploy.
+
+None of this has been executed as part of this task.
 
 Run locally against the sandbox base URL first
 (`SELCOM_BUSINESS_ENVIRONMENT=sandbox`) — no production disbursement until

@@ -25,11 +25,12 @@ through this module:
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -55,6 +56,7 @@ from app.integrations.selcom_business.errors import (
     SelcomResultOutcome,
 )
 from app.integrations.selcom_business.schemas import interpret_resultcode, money_from_provider
+from app.models.audit import AuditLog
 from app.models.finance import Withdrawal, WithdrawalDestination, WithdrawalEvent
 from app.models.onboarding import EmailEvent
 from app.repositories.finance import (
@@ -258,6 +260,53 @@ class PayoutService:
             withdrawal, to_status=WithdrawalStatus.FAILED, actor_id=actor_id, reason=reason
         )
 
+    # ------------------------------------------------------------- limits
+
+    async def _enforce_withdrawal_limits(self, *, tenant_id: UUID, amount: Decimal) -> None:
+        """Every limit defaults to None (unenforced) — see
+        Settings.withdrawal_*_limit_* — until an operator makes a real
+        product decision and sets one. Checked before any funds are
+        reserved, alongside the other request_withdrawal gates. Daily
+        totals are a UTC calendar-day boundary and count every status
+        except CANCELLED/REJECTED/FAILED (see
+        WithdrawalRepository.daily_totals)."""
+        settings = get_settings()
+
+        min_amount = settings.withdrawal_min_amount_tzs
+        if min_amount is not None and amount < min_amount:
+            raise DomainValidationError(
+                f"Withdrawal amount is below the minimum of "
+                f"{settings.withdrawal_min_amount_tzs} {DEFAULT_CURRENCY}"
+            )
+        if (
+            settings.withdrawal_max_single_amount_tzs is not None
+            and amount > settings.withdrawal_max_single_amount_tzs
+        ):
+            raise DomainValidationError(
+                f"Withdrawal amount exceeds the maximum single withdrawal of "
+                f"{settings.withdrawal_max_single_amount_tzs} {DEFAULT_CURRENCY}"
+            )
+
+        daily_limit = settings.withdrawal_daily_limit_tzs
+        daily_count_limit = settings.withdrawal_daily_count_limit
+        if daily_limit is None and daily_count_limit is None:
+            return
+
+        today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        daily_total, daily_count = await self.repo.daily_totals(
+            tenant_id=tenant_id, since=today_start
+        )
+
+        if daily_limit is not None and daily_total + amount > daily_limit:
+            raise DomainValidationError(
+                f"This withdrawal would exceed today's withdrawal limit of "
+                f"{daily_limit} {DEFAULT_CURRENCY} for this tenant"
+            )
+        if daily_count_limit is not None and daily_count + 1 > daily_count_limit:
+            raise DomainValidationError(
+                f"This tenant has reached today's limit of {daily_count_limit} withdrawal(s)"
+            )
+
     # ---------------------------------------------------------------- OTP
 
     async def _resolve_verified_email(self, *, tenant_id: UUID, actor_id: UUID) -> str:
@@ -438,6 +487,8 @@ class PayoutService:
         # tenant whose owner email isn't verified never gets as far as a
         # funds reservation.
         email = await self._resolve_verified_email(tenant_id=tenant_id, actor_id=actor_id)
+
+        await self._enforce_withdrawal_limits(tenant_id=tenant_id, amount=amount)
 
         threshold = get_settings().selcom_withdrawal_approval_threshold_tzs
         approval_required = amount > threshold
@@ -755,11 +806,29 @@ class PayoutService:
         if withdrawal.status != WithdrawalStatus.APPROVED.value:
             return
 
-        if not get_settings().selcom_disbursement_enabled:
+        settings = get_settings()
+        if not settings.selcom_disbursement_enabled:
             await self._fail_withdrawal(
                 withdrawal,
                 reason="Selcom disbursement is disabled on this platform pending "
                 "explicit approval and credentials.",
+                actor_id=actor_id,
+            )
+            return
+
+        # Triple gate for real money: environment=production AND
+        # disbursement_enabled=true (checked above) AND this, independently
+        # true. Flipping SELCOM_BUSINESS_ENVIRONMENT to "production" (even
+        # together with disbursement_enabled) is never, by itself, enough
+        # to submit a real payout — see Settings.selcom_production_payouts_enabled.
+        if (
+            settings.selcom_business_environment == "production"
+            and not settings.selcom_production_payouts_enabled
+        ):
+            await self._fail_withdrawal(
+                withdrawal,
+                reason="Production Selcom payouts are not enabled on this platform "
+                "(SELCOM_PRODUCTION_PAYOUTS_ENABLED is not set).",
                 actor_id=actor_id,
             )
             return
@@ -1006,6 +1075,72 @@ class PayoutService:
         return await self.repo.list_by_statuses(
             statuses=[WithdrawalStatus.PROCESSING.value, WithdrawalStatus.AMBIGUOUS.value]
         )
+
+    async def maybe_alert_stale(self, withdrawal: Withdrawal) -> bool:
+        """Sends at most one Super Admin alert per cooldown window for a
+        withdrawal reconciliation just checked and is STILL PROCESSING or
+        AMBIGUOUS past its configured age threshold — never a payout
+        retry, only a status email (see
+        app/integrations/resend/templates/withdrawals.py). Dedup/cooldown
+        is tracked via the audit trail itself (the most recent
+        withdrawal.stale_alert_sent row for this withdrawal) rather than
+        a new column/table. Returns True only if an alert was actually
+        sent this call."""
+        settings = get_settings()
+        if withdrawal.status == WithdrawalStatus.PROCESSING.value:
+            threshold_minutes = settings.withdrawal_processing_alert_minutes
+        elif withdrawal.status == WithdrawalStatus.AMBIGUOUS.value:
+            threshold_minutes = settings.withdrawal_ambiguous_alert_minutes
+        else:
+            return False
+
+        reference_time = withdrawal.submitted_at or withdrawal.created_at
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=UTC)
+        age_minutes = (datetime.now(UTC) - reference_time).total_seconds() / 60
+        if age_minutes < threshold_minutes:
+            return False
+
+        last_alert_at = await self.db.scalar(
+            select(AuditLog.created_at)
+            .where(
+                AuditLog.target_id == withdrawal.id,
+                AuditLog.action == "withdrawal.stale_alert_sent",
+            )
+            .order_by(AuditLog.created_at.desc())
+            .limit(1)
+        )
+        if last_alert_at is not None:
+            if last_alert_at.tzinfo is None:
+                last_alert_at = last_alert_at.replace(tzinfo=UTC)
+            cooldown = timedelta(minutes=settings.withdrawal_stale_alert_cooldown_minutes)
+            if datetime.now(UTC) - last_alert_at < cooldown:
+                return False
+
+        tenant = await TenantRepository(self.db).get_by_id(tenant_id=None, id=withdrawal.tenant_id)
+        result = await ResendEmailService().send_stale_withdrawal_alert_email(
+            withdrawal_id=withdrawal.id,
+            tenant_name=tenant.name if tenant else str(withdrawal.tenant_id),
+            amount=Decimal(withdrawal.amount),
+            currency=withdrawal.currency,
+            status=withdrawal.status,
+            provider_reference=withdrawal.provider_reference,
+            stuck_minutes=int(age_minutes),
+        )
+        await write_audit_log(
+            self.db,
+            tenant_id=withdrawal.tenant_id,
+            actor_id=None,
+            action="withdrawal.stale_alert_sent",
+            target_type="withdrawal",
+            target_id=withdrawal.id,
+            metadata={
+                "status": withdrawal.status,
+                "stuck_minutes": int(age_minutes),
+                "email_sent": result.sent,
+            },
+        )
+        return result.sent
 
     async def _send_super_admin_review_email(self, withdrawal: Withdrawal) -> None:
         settings = get_settings()
