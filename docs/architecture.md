@@ -514,7 +514,11 @@ way, as a safety net for a missed or never-sent callback. This endpoint is
 publicly reachable over HTTPS at the Railway URL below with no auth
 required (by design — Selcom can't authenticate to it any other way; the
 re-verification against Selcom's own signed API is what makes that safe),
-and only ever queries, never resubmits, on any input.
+and only ever queries, never resubmits, on any input. This callback is
+**inbound** (Selcom → Railway web/backend) — it is unrelated to the
+outbound IP whitelist discussion below entirely; an inbound HTTPS request
+to a publicly reachable endpoint never consumes or depends on an outbound
+whitelist slot on either side.
 
 The same sweep also runs `PayoutService.maybe_alert_stale` on anything
 still unresolved after the query — ONE Super Admin email (Resend) once a
@@ -668,6 +672,90 @@ static-ip status` against both `infinity-radius` and
 `infinity-radius-worker` and update whichever Selcom whitelist(s) are
 active BEFORE relying on that service for provider calls again. Never
 treat a previously-documented IP list as permanent.
+
+### Production IP whitelist capacity — decision gate (not yet resolved)
+
+Selcom's sandbox portal caps whitelist entries at 5 IPs; the real
+architecture needs 6 (web's 3 + worker's 3, a genuinely different set —
+see above). **No production activation may proceed until one of the two
+options below is explicitly selected by the operator** — sandbox keeps
+working today via "continue without whitelisting," which is not available
+as a real answer for production.
+
+**OPTION A — Preferred: ask Selcom to raise the limit.** Keep the current
+architecture (web + worker both call Selcom directly) exactly as-is.
+Operator-ready support message, ready to send, no credentials included:
+
+> **Subject: Production API IP Whitelist Capacity Request**
+>
+> Infinity Radius will use Selcom Business APIs (Collection and
+> Disbursement) from a backend hosted on Railway. Our web/API service has
+> 3 static outbound IPv4 addresses, and a separate reconciliation worker
+> service has 3 different static outbound IPv4 addresses — all six can
+> legitimately originate authenticated provider requests as part of normal
+> high-availability operation (Railway rotates traffic across a service's
+> assigned addresses).
+>
+> Could you confirm:
+> 1. Can the production API whitelist capacity be increased to 6 or more
+>    entries?
+> 2. Is the whitelist scoped per credential/application, or account-wide?
+> 3. Can Collection and Disbursement use separate API applications/
+>    credentials, each with its own whitelist?
+> 4. If so, can we register Collection against 3 IPs and Disbursement
+>    against all 6 as separate applications?
+>
+> The 6 addresses we'd need whitelisted for Disbursement:
+> `208.77.244.241`, `152.55.184.241`, `152.55.185.190` (web/API service)
+> and `208.77.244.240`, `152.55.184.240`, `152.55.185.189` (reconciliation
+> worker service).
+
+If Selcom confirms separate applications/credentials are possible:
+Collection's application/credential only ever needs web's 3 IPs;
+Disbursement's needs all 6 (or, if Option B below is adopted instead,
+Disbursement also drops to needing only web's 3). This is a real
+provider-architecture question this codebase cannot answer on its own —
+included explicitly in the message above rather than assumed.
+
+**OPTION B — Fallback: centralize Selcom egress in web/backend only,**
+if Selcom confirms the limit cannot exceed 5. **Not implemented — design
+only, per this task's explicit scope.**
+
+- The worker would stop instantiating `SelcomBusinessClient` / calling
+  Selcom directly for reconciliation. Instead: Beat → Redis → Worker
+  (unchanged — still finds PROCESSING/AMBIGUOUS rows and decides when a
+  query is due) → a new **internal, service-to-service-authenticated**
+  reconciliation request → `infinity-radius` web/backend → Selcom
+  `transaction/query`.
+- That internal operation may perform **only** `transaction/query` against
+  the withdrawal's existing `idempotency_key`/`transId` — never
+  `transaction/process`, never a new `transId`, never a destination/amount
+  change, never a ledger-state-machine bypass. It would call exactly the
+  same `PayoutService.reconcile_withdrawal` path the webhook and
+  `/requery` already use today — the state-machine/idempotency guarantees
+  described throughout this document are unaffected either way.
+- **Security**: never a public unauthenticated endpoint, never a tenant
+  JWT, never reachable from a browser client. Preferred: Railway private
+  networking (`RAILWAY_PRIVATE_DOMAIN`, already present on every service —
+  see the env var list above) combined with a dedicated internal
+  HMAC-signed request (a fresh, short-lived signature per call, verified
+  server-side) — the same pattern already used for router-token signing
+  and Network Agent authentication in this codebase (`app/core/security.py`
+  equivalents), never network location alone.
+- **Worker's role is unchanged in substance** — it still owns "which
+  withdrawal needs reconciling and when"; only the actual outbound HTTP
+  call to Selcom moves into web/backend. Provider credentials
+  (`SELCOM_BUSINESS_API_KEY`, `SELCOM_BUSINESS_PRIVATE_KEY_B64`) would no
+  longer need to exist on `infinity-radius-worker` at all — a genuine
+  least-privilege improvement: one fewer service holding the ability to
+  sign requests to a payment provider.
+- **Resulting IP requirement**: both Collection and Disbursement whitelists
+  become identical — web's 3 IPs only (`208.77.244.241`, `152.55.184.241`,
+  `152.55.185.190`) — comfortably inside the observed 5-IP sandbox cap.
+
+**Neither option has been activated.** Current architecture (web + worker
+both calling Selcom directly) remains exactly as it is; worker's Static
+Outbound IP stays enabled and healthy while this decision is pending.
 
 **Custom API domain** — none exists yet; the public backend URL remains
 `https://infinity-radius-production.up.railway.app` (used as-is for the
