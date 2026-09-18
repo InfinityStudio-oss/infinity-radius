@@ -23,6 +23,7 @@ from app.integrations.network_agent.client import (
 from app.integrations.selcom_business.client import SelcomBusinessClient
 from app.integrations.selcom_business.config import selcom_business_config_from_settings
 from app.integrations.selcom_business.errors import SelcomBusinessError
+from app.integrations.selcom_business.schemas import money_from_provider
 from app.schemas.envelope import ApiResponse
 
 router = APIRouter()
@@ -104,6 +105,26 @@ async def diagnose_selcom_business(
             )
         )
 
+    # Environment-aware safety: _SANDBOX_TEST_ACCOUNT is Selcom's own
+    # published SANDBOX sample account — there is no documented safe
+    # production equivalent, so this diagnostic must never fire it against
+    # a production base URL. Never a disbursement either way (account
+    # lookup only), but sending a known-fake test account to a live
+    # production endpoint is exactly the "invented behavior" this platform
+    # avoids — refuse closed instead of guessing.
+    if config.environment != "sandbox":
+        return ApiResponse(
+            data=SelcomBusinessDiagnosticResult(
+                configured=True,
+                environment=config.environment,
+                reachable=False,
+                detail="This diagnostic only ever runs against sandbox — "
+                "SELCOM_BUSINESS_ENVIRONMENT is not 'sandbox', so no request was sent. "
+                "No documented safe production connectivity check exists yet; see "
+                "docs/architecture.md's production activation runbook.",
+            )
+        )
+
     client = SelcomBusinessClient(config)
     try:
         response = await client.account_lookup(
@@ -128,5 +149,85 @@ async def diagnose_selcom_business(
             reachable=True,
             resultcode=response.resultcode,
             message=response.message,
+        )
+    )
+
+
+class SelcomProviderBalanceResult(BaseModel):
+    """"Selcom Provider Balance" — the platform's own Selcom Business
+    operating account, never a tenant's wallet balance (see
+    app/services/wallet.py for that, an entirely separate concept). Only
+    ever visible to SUPER_ADMIN, never surfaced to any tenant route."""
+
+    configured: bool
+    environment: str | None = None
+    available_balance: str | None = None
+    currency: str | None = None
+    masked_account_number: str | None = None
+    detail: str | None = None
+
+
+def _mask_account_number(account_number: str | None) -> str | None:
+    if not account_number:
+        return None
+    if len(account_number) <= 4:
+        return "*" * len(account_number)
+    return "*" * (len(account_number) - 4) + account_number[-4:]
+
+
+@router.post(
+    "/selcom-business/provider-balance", response_model=ApiResponse[SelcomProviderBalanceResult]
+)
+async def selcom_provider_balance(
+    user: AuthenticatedUser = Depends(require_super_admin),
+) -> ApiResponse[SelcomProviderBalanceResult]:
+    """Read-only — the ONE Selcom Business endpoint that reports the
+    platform's own operating balance, not any customer/tenant balance.
+    SUPER_ADMIN-only (no tenant route ever calls this); never invented —
+    only exposes what developer.selcom.business's own Balance endpoint
+    returns."""
+    config = selcom_business_config_from_settings()
+    if not config.is_configured or not config.account_number:
+        return ApiResponse(
+            data=SelcomProviderBalanceResult(
+                configured=False,
+                environment=config.environment,
+                detail="SELCOM_BUSINESS_BASE_URL/API_KEY/PRIVATE_KEY_B64/ACCOUNT_NUMBER "
+                "not fully configured",
+            )
+        )
+
+    # Same environment-aware safety as diagnose_selcom_business above —
+    # never call a production endpoint using this platform's own sandbox
+    # account number by accident.
+    if config.environment != "sandbox":
+        return ApiResponse(
+            data=SelcomProviderBalanceResult(
+                configured=True,
+                environment=config.environment,
+                detail="This diagnostic only ever runs against sandbox — "
+                "SELCOM_BUSINESS_ENVIRONMENT is not 'sandbox', so no request was sent.",
+            )
+        )
+
+    client = SelcomBusinessClient(config)
+    try:
+        response = await client.balance(account_number=config.account_number)
+    except SelcomBusinessError as exc:
+        return ApiResponse(
+            data=SelcomProviderBalanceResult(
+                configured=True, environment=config.environment, detail=str(exc)
+            )
+        )
+
+    data = response.data
+    balance_value = money_from_provider(data.available_balance) if data else None
+    return ApiResponse(
+        data=SelcomProviderBalanceResult(
+            configured=True,
+            environment=config.environment,
+            available_balance=str(balance_value) if balance_value is not None else None,
+            currency=data.currency if data else None,
+            masked_account_number=_mask_account_number(config.account_number),
         )
     )

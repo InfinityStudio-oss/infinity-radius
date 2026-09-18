@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.pagination import ListParams, build_pagination_meta, list_params
 from app.core.roles import Role
 from app.core.security import AuthenticatedUser, require_role
 from app.db.session import get_db
@@ -36,6 +37,28 @@ async def list_pending_withdrawals(
         meta=PaginationMeta(
             page=1, page_size=max(len(items), 1), total=len(items), total_pages=1 if items else 0
         ),
+    )
+
+
+# Registered before "/{withdrawal_id}" — otherwise FastAPI tries to parse
+# "all" as a UUID and this route is never reached (the same fix
+# app/api/v1/payouts.py already applied for "/destinations").
+@router.get("/all", response_model=ApiListResponse[WithdrawalRead])
+async def list_all_withdrawals(
+    params: ListParams = Depends(list_params),
+    _: AuthenticatedUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiListResponse[WithdrawalRead]:
+    """The broader operational view — every tenant, every status,
+    paginated/searchable/filterable (`?status=PROCESSING`,
+    `?status=AMBIGUOUS`, etc.) — distinct from the narrower
+    GET "" approval queue above. Read-only; no action is exposed here
+    beyond what {withdrawal_id}/approve|reject|requery already allow."""
+    service = PayoutService(db)
+    items, total = await service.list_all_for_super_admin(params=params)
+    return ApiListResponse(
+        data=[WithdrawalRead.model_validate(item) for item in items],
+        meta=build_pagination_meta(total=total, params=params),
     )
 
 

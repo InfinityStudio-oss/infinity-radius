@@ -159,6 +159,17 @@ class PayoutService:
             raise NotFoundError("Withdrawal not found")
         return withdrawal
 
+    async def list_all_for_super_admin(
+        self, *, params: ListParams
+    ) -> tuple[list[Withdrawal], int]:
+        """Every withdrawal, any tenant, any status — the broader
+        operational view (see GET /api/v1/admin/withdrawals/all) distinct
+        from list_pending_super_admin_approval's narrower approval queue.
+        `?status=PROCESSING` (etc.) filters via the existing generic
+        list_paginated mechanism — WithdrawalRepository already declares
+        "status" as a filterable field."""
+        return await self.repo.list_paginated(tenant_id=None, params=params)
+
     async def list_events(
         self, *, tenant_id: UUID, withdrawal_id: UUID
     ) -> list[WithdrawalEvent]:

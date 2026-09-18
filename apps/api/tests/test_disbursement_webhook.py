@@ -275,3 +275,92 @@ def test_transport_error_during_submission_never_resubmits_and_reconciles_via_qu
     # The reconciliation query (also mocked) resolved it to COMPLETED —
     # proving the timeout path queries rather than giving up or retrying.
     assert confirm_response.json()["data"]["status"] == "SUCCESS"
+
+
+def test_admin_requery_requires_super_admin_and_never_resubmits(
+    monkeypatch: pytest.MonkeyPatch, capture_withdrawal_otp: list[str]
+) -> None:
+    """POST /api/v1/admin/withdrawals/{id}/requery — the one safe manual
+    action for a stuck withdrawal. Verifies RBAC (tenant forbidden), that
+    it genuinely resolves a real PROCESSING row via query, and that it
+    calls transaction_query exactly once and transaction_process zero
+    times (never a resubmit)."""
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        owner_headers = auth_header(user_id=owner_id)
+        admin_headers = auth_header(user_id=admin_id)
+        ctx.new_settlement_config(tenant_id=tenant_id)
+        ctx.new_tenant_feature_flags(tenant_id=tenant_id, payout_enabled=True)
+        ctx.new_tenant_verification(tenant_id=tenant_id, status="APPROVED", email_verified=True)
+        asyncio.run(_credit_available(tenant_id, admin_id, "1000.00"))
+
+        destination_id = client.post(
+            "/api/v1/payouts/destinations",
+            headers=owner_headers,
+            json={
+                "label": "M-Pesa",
+                "channel": "mobile_money",
+                "destination_code": "MPESA",
+                "account_number": "255700000000",
+            },
+        ).json()["data"]["id"]
+        request_response = client.post(
+            "/api/v1/payouts",
+            headers=owner_headers,
+            json={"destination_id": destination_id, "amount": "600.00"},
+        )
+        withdrawal_id = request_response.json()["withdrawal"]["id"]
+        code = capture_withdrawal_otp[-1]
+
+        _fake_account_lookup(monkeypatch)
+        _fake_transaction_process_inprogress(monkeypatch)
+
+        confirm_response = client.post(
+            f"/api/v1/payouts/{withdrawal_id}/confirm-2fa",
+            headers=owner_headers,
+            json={"code": code},
+        )
+        assert confirm_response.json()["data"]["status"] == "PROCESSING"
+
+        process_calls = 0
+        query_calls = 0
+
+        async def _counting_transaction_process(
+            self: SelcomBusinessClient, **kwargs: object
+        ) -> None:
+            nonlocal process_calls
+            process_calls += 1
+            raise AssertionError("transaction_process must never be called by requery")
+
+        monkeypatch.setattr(
+            SelcomBusinessClient, "transaction_process", _counting_transaction_process
+        )
+
+        async def _counting_query(self: SelcomBusinessClient, *, trans_id: str) -> object:
+            nonlocal query_calls
+            query_calls += 1
+            return TransactionQueryResponse(
+                success=True,
+                resultcode="000",
+                data=TransactionQueryData(
+                    trans_id=trans_id, status="COMPLETED", amount=Decimal("600.00"),
+                    currency="TZS", selcom_receipt=f"RCPT-{trans_id}",
+                ),
+            )
+
+        monkeypatch.setattr(SelcomBusinessClient, "transaction_query", _counting_query)
+
+        tenant_forbidden = client.post(
+            f"/api/v1/admin/withdrawals/{withdrawal_id}/requery", headers=owner_headers
+        )
+        requery_response = client.post(
+            f"/api/v1/admin/withdrawals/{withdrawal_id}/requery", headers=admin_headers
+        )
+
+    assert tenant_forbidden.status_code == 403
+    assert requery_response.status_code == 200
+    assert requery_response.json()["data"]["status"] == "SUCCESS"
+    assert query_calls == 1
+    assert process_calls == 0

@@ -955,3 +955,49 @@ def test_confirming_an_already_verified_withdrawal_again_is_refused(
     assert first_response.status_code == 200
     assert second_response.status_code == 422
     assert "not awaiting 2FA confirmation" in second_response.json()["error"]["message"]
+
+
+# --------------------------------------------------- admin "all withdrawals"
+
+
+def test_admin_all_withdrawals_sees_every_status_and_filters_by_status(
+    capture_withdrawal_otp: list[str],
+) -> None:
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
+        owner_id = ctx.new_user(role_code="TENANT_OWNER", tenant_id=tenant_id)
+        admin_headers = auth_header(user_id=admin_id)
+        headers = auth_header(user_id=owner_id)
+        _enable_payouts(ctx, tenant_id=tenant_id)
+        asyncio.run(_credit_available(tenant_id, admin_id, "300000.00"))
+
+        # One DRAFT (never confirmed) and one over-threshold PENDING_APPROVAL.
+        draft_id, _draft_code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="600.00"
+        )
+        pending_id, pending_code = _request_withdrawal(
+            ctx, owner_headers=headers, otp_inbox=capture_withdrawal_otp, amount="150000.00"
+        )
+        client.post(
+            f"/api/v1/payouts/{pending_id}/confirm-2fa",
+            headers=headers,
+            json={"code": pending_code},
+        )
+
+        all_response = client.get("/api/v1/admin/withdrawals/all", headers=admin_headers)
+        draft_only_response = client.get(
+            "/api/v1/admin/withdrawals/all?status=DRAFT", headers=admin_headers
+        )
+        tenant_scoped_attempt = client.get("/api/v1/admin/withdrawals/all", headers=headers)
+
+    assert all_response.status_code == 200
+    all_ids = {item["id"] for item in all_response.json()["data"]}
+    assert {draft_id, pending_id} <= all_ids
+
+    assert draft_only_response.status_code == 200
+    draft_ids = {item["id"] for item in draft_only_response.json()["data"]}
+    assert draft_id in draft_ids
+    assert pending_id not in draft_ids
+
+    assert tenant_scoped_attempt.status_code == 403

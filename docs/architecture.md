@@ -576,13 +576,43 @@ sends stale-alert email). `infinity-radius-beat` holds neither — it only
 ever schedules the task by name, never executes its body — plus none of
 `SUPABASE_SECRET_KEY`/`SUPER_ADMIN_REVIEW_EMAIL`/`NETWORK_AGENT_*` either.
 
-**IP whitelist** — Railway's current static outbound IPs (as of this
-writing) are `208.77.244.241`, `152.55.184.241`, `152.55.185.190`.
-**Before any future production activation, re-check Railway's actual
-current static outbound IPs** (Settings → Networking on the `infinity-
-radius` service) rather than assuming these — Railway can change them, and
-the production Selcom portal must whitelist whatever is current at
-activation time, not this list.
+**Selcom provider balance** — `POST /admin/diagnostics/selcom-business/
+provider-balance` (SUPER_ADMIN only) exposes developer.selcom.business's
+own Balance endpoint result, explicitly labeled "Selcom Provider Balance"
+and never confused with a tenant's wallet balance (an entirely separate
+concept — see `app/services/wallet.py`). Masks the configured account
+number to its last 4 digits even for Super Admin. Same environment-aware
+safety as the connectivity diagnostic: refuses to call anything unless
+`SELCOM_BUSINESS_ENVIRONMENT=sandbox`. Never exposed to any tenant route.
+
+**Broader withdrawal visibility** — `GET /admin/withdrawals/all`
+(SUPER_ADMIN only, optionally `?status=PROCESSING` etc.) lists every
+withdrawal across every tenant and status — `DRAFT`, `PENDING_APPROVAL`,
+`PROCESSING`, `AMBIGUOUS`, `SUCCESS`, `FAILED`, `REJECTED`, `CANCELLED`,
+`REVERSED` — distinct from the narrower `GET /admin/withdrawals` approval
+queue (`PENDING_APPROVAL` only, unchanged). The Super Admin disbursements
+page now has tabs for each status plus a reconciliation-health banner and
+a per-row "Re-query Provider" action for `PROCESSING`/`AMBIGUOUS` rows —
+never a resubmit/resend action, which does not exist anywhere in this
+API.
+
+**IP whitelist** — Railway's current static outbound IPs, live-reconfirmed
+via `railway outbound-network static-ip status` (not assumed from a
+historical list): `208.77.244.241`, `152.55.184.241`, `152.55.185.190` —
+unchanged since first documented. **Before any future production
+activation, re-run that same command** rather than trusting this list —
+Railway can change these, and the production Selcom portal must whitelist
+whatever is current at activation time.
+
+Both the web service (synchronous submission) and the worker service
+(reconciliation queries) make real outbound Selcom calls, so **both**
+need Static Outbound IP enabled with the same three addresses — this was
+found disabled on `infinity-radius-worker` during this task (only the web
+service had it) and has been enabled. Confirm this with the same command
+against `infinity-radius-worker` before production activation; a mismatch
+here would silently fail every production reconciliation query even
+though sandbox testing showed no problem (sandbox doesn't enforce the
+whitelist as strictly).
 
 **Custom API domain** — none exists yet; the public backend URL remains
 `https://infinity-radius-production.up.railway.app` (used as-is for the
@@ -634,6 +664,98 @@ has been run; `SELCOM_BUSINESS_ENVIRONMENT` remains `sandbox` and
     switch is designed to be fast and requires no deploy.
 
 None of this has been executed as part of this task.
+
+**Abort conditions** — stop and set `SELCOM_PRODUCTION_PAYOUTS_ENABLED=
+false` immediately (never manually edit a financial DB row to "fix" it)
+if, during the first real payout, any of: a provider configuration
+mismatch, an unexpected base URL, an IP-whitelist rejection, an RSA
+signature failure, a wallet inconsistency, an unexpected duplicate
+provider request, an unknown/unrecognized status, reconciliation being
+unavailable, a callback amount mismatch, a ledger mismatch, or any OTP
+security issue.
+
+**Success criteria** — the first real payout is successful only if:
+exactly one withdrawal was created, exactly one reservation, exactly one
+provider `transId`, the provider accepted/completed it, a provider receipt
+was recorded, the wallet amount and `total_disbursed` are both correct,
+the reservation returned to exactly zero, exactly one final ledger debit
+exists, the OTP was genuinely verified, no secret leaked anywhere, the
+audit trail is complete, and the callback/reconciliation path proved
+idempotent (a repeat produced no second effect).
+
+**High-value (>100,000 TZS) production test — separate, later, only after
+the small test above succeeds cleanly.** Expected sequence: funds reserve
+→ OTP email → OTP verified → `PENDING_APPROVAL` (provider_reference stays
+`null`) → Resend Super Admin email → Super Admin reviews and approves →
+exactly one `transaction/process` call → provider completion → ledger
+finalization. A separate reject test (same setup, Super Admin rejects
+instead) should also be run once, confirming the reservation releases and
+Selcom is never called. Neither has been executed as part of this task.
+
+**Pre-payout checklist** — require ALL of the following true before
+`SELCOM_PRODUCTION_PAYOUTS_ENABLED` is ever set `true`:
+
+- [ ] Selcom production credentials configured (Railway only)
+- [ ] Production base URL correct and environment-paired
+  (`validate_selcom_startup_config` passing)
+- [ ] Railway's *current* static outbound IPs whitelisted in the
+  production Selcom portal (re-check — don't trust a historical list)
+- [ ] Production callback configured in the Selcom portal
+- [ ] Backend (`infinity-radius`), Worker, Beat, Redis, Supabase, Resend
+  all healthy
+- [ ] `alembic current` confirms production is at head, no unapplied
+  migration, migration safety guard active
+- [ ] OTP delivery tested (a real email received)
+- [ ] Test tenant has sufficient available wallet balance
+- [ ] Withdrawal destination account verified
+- [ ] Withdrawal limit policy explicitly approved by the operator (see
+  below — currently NOT decided)
+- [ ] Production Selcom provider balance sufficient (if/when balance
+  visibility exists — see below)
+- [ ] `SELCOM_DISBURSEMENT_ENABLED=true`
+- [ ] `SELCOM_BUSINESS_ENVIRONMENT=production`
+- [ ] `SELCOM_PRODUCTION_PAYOUTS_ENABLED=false` initially, even with
+  everything else above true
+- [ ] Explicit operator final sign-off obtained
+
+Only after every box above is checked may
+`SELCOM_PRODUCTION_PAYOUTS_ENABLED` be set `true` — and not as part of
+this task.
+
+**Operator monitoring checklist** for the first payout (never expose a
+secret while watching): Railway web logs, Worker logs, Beat logs, the
+Super Admin dashboard, `GET /super-admin/reconciliation-health`, the
+withdrawal's own event history, the Selcom Business portal's own
+transaction view, and the wallet/ledger state.
+
+### Withdrawal limit policy — operator decision required
+
+`WITHDRAWAL_MIN_AMOUNT_TZS`, `WITHDRAWAL_MAX_SINGLE_AMOUNT_TZS`,
+`WITHDRAWAL_DAILY_LIMIT_TZS`, `WITHDRAWAL_DAILY_COUNT_LIMIT` are all
+implemented, tested, and currently **unset (disabled)** — confirmed live
+on Railway. No operator has yet made a real product/risk decision on
+these four values. This platform will not silently activate one.
+
+The four decisions needed:
+
+| # | Decision | Variable |
+|---|---|---|
+| A | Minimum single withdrawal | `WITHDRAWAL_MIN_AMOUNT_TZS` |
+| B | Maximum single withdrawal | `WITHDRAWAL_MAX_SINGLE_AMOUNT_TZS` |
+| C | Maximum a tenant may withdraw in one day (sum) | `WITHDRAWAL_DAILY_LIMIT_TZS` |
+| D | Maximum withdrawals a tenant may make in one day (count) | `WITHDRAWAL_DAILY_COUNT_LIMIT` |
+
+**OPTIONAL STARTING PROPOSAL — Infinity Radius internal risk-control
+suggestion only, NOT a Selcom limit, NOT active, NOT in Railway, and
+requires explicit operator approval before it becomes any of those:**
+
+- Minimum: TZS 5,000
+- Maximum single: TZS 2,000,000
+- Daily amount: TZS 5,000,000
+- Daily count: 5
+
+These are starting-point suggestions for the operator to accept, adjust,
+or reject — not a decision this codebase has made on anyone's behalf.
 
 Run locally against the sandbox base URL first
 (`SELCOM_BUSINESS_ENVIRONMENT=sandbox`) — no production disbursement until
