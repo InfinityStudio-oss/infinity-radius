@@ -591,9 +591,14 @@ provider-balance` (SUPER_ADMIN only) exposes developer.selcom.business's
 own Balance endpoint result, explicitly labeled "Selcom Provider Balance"
 and never confused with a tenant's wallet balance (an entirely separate
 concept — see `app/services/wallet.py`). Masks the configured account
-number to its last 4 digits even for Super Admin. Same environment-aware
-safety as the connectivity diagnostic: refuses to call anything unless
-`SELCOM_BUSINESS_ENVIRONMENT=sandbox`. Never exposed to any tenant route.
+number to its last 4 digits even for Super Admin. Unlike
+`diagnose_selcom_business` (account-lookup, which uses a hardcoded
+sandbox-only test account and refuses to run outside sandbox), this
+check is safe in EITHER environment — it always queries whichever
+`SELCOM_BUSINESS_ACCOUNT_NUMBER` is actually configured, never a fake
+one — so it's the intended non-money-moving production connectivity
+check (see the production activation runbook below). Never exposed to
+any tenant route.
 
 **Broader withdrawal visibility** — `GET /admin/withdrawals/all`
 (SUPER_ADMIN only, optionally `?status=PROCESSING` etc.) lists every

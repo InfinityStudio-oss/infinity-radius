@@ -197,19 +197,14 @@ async def selcom_provider_balance(
             )
         )
 
-    # Same environment-aware safety as diagnose_selcom_business above —
-    # never call a production endpoint using this platform's own sandbox
-    # account number by accident.
-    if config.environment != "sandbox":
-        return ApiResponse(
-            data=SelcomProviderBalanceResult(
-                configured=True,
-                environment=config.environment,
-                detail="This diagnostic only ever runs against sandbox — "
-                "SELCOM_BUSINESS_ENVIRONMENT is not 'sandbox', so no request was sent.",
-            )
-        )
-
+    # Unlike diagnose_selcom_business above, this is safe in EITHER
+    # environment: it always queries whichever account_number is actually
+    # configured (sandbox's own test account when environment=sandbox,
+    # the real production account when environment=production) — there is
+    # no hardcoded/fake account that could be misdirected at the wrong
+    # environment. Read-only, no money movement either way. This is the
+    # intended non-money-moving production connectivity check (see
+    # docs/architecture.md's production activation runbook).
     client = SelcomBusinessClient(config)
     try:
         response = await client.balance(account_number=config.account_number)

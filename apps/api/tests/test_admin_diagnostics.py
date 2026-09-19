@@ -339,23 +339,33 @@ def test_provider_balance_masks_the_account_number_and_never_leaks_credentials(
     assert "test-key-never-real" not in str(response.json())
 
 
-def test_provider_balance_production_environment_refuses_to_call(
+def test_provider_balance_production_environment_proceeds_to_the_real_call(
     real_settings_override: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Unlike the account-lookup diagnostic (which uses a hardcoded
+    sandbox-only test account and must never run in production), the
+    balance check always queries whichever account_number is actually
+    configured — safe, read-only, and correct in either environment. This
+    is the non-money-moving production connectivity check the production
+    activation runbook relies on."""
     monkeypatch.setenv("SELCOM_BUSINESS_ENVIRONMENT", "production")
     monkeypatch.setenv("SELCOM_BUSINESS_BASE_URL", "https://api.selcom.business")
     monkeypatch.setenv("SELCOM_BUSINESS_API_KEY", "test-key-never-real")
-    monkeypatch.setenv("SELCOM_BUSINESS_ACCOUNT_NUMBER", "8774738353235")
+    monkeypatch.setenv("SELCOM_BUSINESS_ACCOUNT_NUMBER", "5529108708283")
     monkeypatch.setenv(
         "SELCOM_BUSINESS_PRIVATE_KEY_B64",
         __import__("base64").b64encode(b"not-a-real-pem-just-passes-is_configured").decode(),
     )
     get_settings.cache_clear()
 
-    async def _fail_if_called(self: SelcomBusinessClient, **kwargs: object) -> None:
-        raise AssertionError("balance() must never be called against production here")
+    async def _fake_balance(self: SelcomBusinessClient, **kwargs: object) -> BalanceResponse:
+        return BalanceResponse(
+            success=True,
+            resultcode="000",
+            data=BalanceData(available_balance="1250000.00", currency="TZS"),
+        )
 
-    monkeypatch.setattr(SelcomBusinessClient, "balance", _fail_if_called)
+    monkeypatch.setattr(SelcomBusinessClient, "balance", _fake_balance)
 
     with SeededContext() as ctx:
         admin_id = ctx.new_user(role_code="SUPER_ADMIN", tenant_id=None)
@@ -363,5 +373,9 @@ def test_provider_balance_production_environment_refuses_to_call(
 
     assert response.status_code == 200
     data = response.json()["data"]
-    assert data["available_balance"] is None
-    assert "sandbox" in data["detail"].lower()
+    assert data["configured"] is True
+    assert data["environment"] == "production"
+    assert data["available_balance"] == "1250000.00"
+    assert data["masked_account_number"] == "*********8283"
+    assert "5529108708283" not in str(response.json())
+    assert "test-key-never-real" not in str(response.json())
