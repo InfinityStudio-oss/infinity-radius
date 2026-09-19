@@ -1,10 +1,20 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.enums import DestinationCode, LedgerDirection, SettlementMode, WalletBucket
 from app.core.money import Money
+
+if TYPE_CHECKING:
+    from app.models.finance import Transaction
+
+
+def _mask_phone(phone: str | None) -> str | None:
+    if not phone or len(phone) <= 7:
+        return phone
+    return f"{phone[:4]}{'*' * (len(phone) - 7)}{phone[-3:]}"
 
 
 class TransactionRead(BaseModel):
@@ -16,12 +26,62 @@ class TransactionRead(BaseModel):
     subscription_id: UUID | None
     reference: str
     provider_reference: str | None
+    collection_transid: str | None = None
+    # Never the raw payer_phone column — see _mask_phone/from_transaction.
+    payer_phone_masked: str | None = None
     channel: str | None
     amount: Money
     currency: str
     status: str
+    provider_resultcode: str | None = None
+    provider_message: str | None = None
+    stk_requested_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+    @classmethod
+    def from_transaction(cls, transaction: "Transaction") -> "TransactionRead":
+        """The only way a Transaction ORM row becomes a TransactionRead —
+        never plain model_validate(transaction), which would have no way
+        to mask payer_phone (a column that doesn't exist on this schema
+        at all, on purpose — see _mask_phone)."""
+        return cls(
+            id=transaction.id,
+            tenant_id=transaction.tenant_id,
+            customer_id=transaction.customer_id,
+            subscription_id=transaction.subscription_id,
+            reference=transaction.reference,
+            provider_reference=transaction.provider_reference,
+            collection_transid=transaction.collection_transid,
+            payer_phone_masked=_mask_phone(transaction.payer_phone),
+            channel=transaction.channel,
+            amount=transaction.amount,
+            currency=transaction.currency,
+            status=transaction.status,
+            provider_resultcode=transaction.provider_resultcode,
+            provider_message=transaction.provider_message,
+            stk_requested_at=transaction.stk_requested_at,
+            completed_at=transaction.completed_at,
+            failed_at=transaction.failed_at,
+            created_at=transaction.created_at,
+            updated_at=transaction.updated_at,
+        )
+
+
+class CollectionCreate(BaseModel):
+    """Requests one Selcom Mobile Checkout Collection attempt (create
+    order + STK push) — see app/services/collections.py. `customer_id`
+    is optional (a walk-in/one-off payment need not be tied to an
+    existing customer record), but `phone` is always required — it's
+    where the STK prompt goes."""
+
+    customer_id: UUID | None = None
+    amount: Money
+    currency: str = "TZS"
+    phone: str
+    description: str | None = None
 
 
 class WalletRead(BaseModel):

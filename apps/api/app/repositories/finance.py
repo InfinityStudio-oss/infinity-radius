@@ -35,6 +35,20 @@ class TransactionRepository(BaseRepository[Transaction]):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_reference_for_update(self, *, reference: str) -> Transaction | None:
+        """Same as get_by_reference, but takes a row lock — see
+        app.services.collections for why finalization (webhook,
+        reconciliation, internal HMAC endpoint) always goes through this,
+        never the unlocked lookup above."""
+        stmt = select(Transaction).where(Transaction.reference == reference).with_for_update()
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_by_statuses(self, *, statuses: list[str]) -> list[Transaction]:
+        stmt = select(Transaction).where(Transaction.status.in_(statuses))
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
 
 class PaymentWebhookRepository(BaseRepository[PaymentWebhook]):
     model = PaymentWebhook

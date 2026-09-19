@@ -27,7 +27,13 @@ from app.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class Transaction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """A customer payment. Populated once Selcom Collection is implemented — never fabricated."""
+    """A customer payment — Selcom Mobile Checkout Collection (STK push),
+    see app/integrations/selcom_collection/ and app/services/collections.py.
+    `reference` is OUR OWN server-generated order_id, sent to Selcom's
+    create-order-minimal as `order_id` and used to look this row up from
+    an inbound webhook/reconciliation (globally unique by construction,
+    not just per-tenant — see CollectionService — since a webhook arrives
+    before the tenant is known)."""
 
     __tablename__ = "transactions"
     __table_args__ = (UniqueConstraint("tenant_id", "reference"),)
@@ -42,14 +48,28 @@ class Transaction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True
     )
     reference: Mapped[str] = mapped_column(Text, nullable=False)
-    # Selcom's own Collection order identifier, once a real order-creation
-    # call returns one — see app/integrations/selcom/collection.py.
+    # Selcom Gateway's own payment identifier (order-status/webhook
+    # `data.reference`) — "Available on COMPLETED payments only" per
+    # Selcom's docs.
     provider_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Our own server-generated transid sent to wallet-payment (the STK
+    # request's own idempotency key) — echoed back by Selcom on
+    # completion. Never Selcom-supplied at request time.
+    collection_transid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Normalized 255XXXXXXXXX — the msisdn the STK prompt was sent to.
+    payer_phone: Mapped[str | None] = mapped_column(Text, nullable=True)
     channel: Mapped[str | None] = mapped_column(Text, nullable=True)
     amount: Mapped[str] = mapped_column(Numeric(14, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, server_default="TZS")
-    # pending | completed | failed
-    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    # app.core.enums.CollectionStatus
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="CREATED")
+    provider_resultcode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stk_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class PaymentWebhook(UUIDPrimaryKeyMixin, Base):

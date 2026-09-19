@@ -115,6 +115,44 @@ class WithdrawalStatus(StrEnum):
     REVERSED = "REVERSED"  # a completed disbursement was later reversed
 
 
+class CollectionStatus(StrEnum):
+    """A Selcom Mobile Checkout Collection order's lifecycle — see
+    app/services/collections.py and app/integrations/selcom_collection/
+    for exactly which methods cause which transition.
+    STK_SENT/PENDING/INPROGRESS are all "wallet-payment accepted, no
+    authoritative result yet" — kept distinct only because Selcom's own
+    two calls (wallet-payment's initial "111/PENDING" ack vs order-
+    status's own "PENDING"/"INPROGRESS" payment_status) use different
+    words for adjacent points in the same wait. Never re-send a second
+    STK for a row already past CREATED — a new customer attempt gets a
+    new order_id/transid instead (see docs/architecture.md)."""
+
+    CREATED = "CREATED"  # order created with Selcom, no STK sent yet
+    STK_SENT = "STK_SENT"  # wallet-payment accepted (resultcode 111) — awaiting the customer
+    PENDING = "PENDING"  # order-status query: still waiting, not yet resolved
+    INPROGRESS = "INPROGRESS"  # order-status query: actively resolving
+    COMPLETED = "COMPLETED"  # verified paid — the ONLY status that may ever credit the wallet
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"  # cancelled before/without customer action
+    USERCANCELLED = "USERCANCELLED"  # the customer declined the STK prompt
+    REJECTED = "REJECTED"
+    AMBIGUOUS = "AMBIGUOUS"  # provider result didn't safely match what we expected
+    EXPIRED = "EXPIRED"  # never resolved within the order's expiry window
+
+
+# Terminal states — a Collection order in one of these never transitions again.
+COLLECTION_TERMINAL_STATUSES = frozenset(
+    {
+        CollectionStatus.COMPLETED,
+        CollectionStatus.FAILED,
+        CollectionStatus.CANCELLED,
+        CollectionStatus.USERCANCELLED,
+        CollectionStatus.REJECTED,
+        CollectionStatus.EXPIRED,
+    }
+)
+
+
 class ProviderAmountMatch(StrEnum):
     """Which exact form matched Selcom's reported transaction/query amount
     against this withdrawal — recorded on finalization (see

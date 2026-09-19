@@ -5,8 +5,10 @@ from app.api.v1.admin_tenants import router as admin_tenants_router
 from app.api.v1.admin_withdrawals import router as admin_withdrawals_router
 from app.api.v1.audit import router as audit_router
 from app.api.v1.auth import router as auth_router
+from app.api.v1.collections import router as collections_router
 from app.api.v1.customers import router as customers_router
 from app.api.v1.dashboard import router as dashboard_router
+from app.api.v1.internal_collections import router as internal_collections_router
 from app.api.v1.internal_disbursements import router as internal_disbursements_router
 from app.api.v1.locations import router as locations_router
 from app.api.v1.onboarding import router as onboarding_router
@@ -41,6 +43,7 @@ api_router.include_router(subscriptions_router, prefix="/subscriptions", tags=["
 api_router.include_router(sessions_router, prefix="/sessions", tags=["sessions"])
 api_router.include_router(vouchers_router, prefix="/vouchers", tags=["vouchers"])
 api_router.include_router(payments_router, prefix="/payments", tags=["payments"])
+api_router.include_router(collections_router, prefix="/collections", tags=["collections"])
 api_router.include_router(wallet_router, prefix="/wallet", tags=["wallet"])
 api_router.include_router(payouts_router, prefix="/payouts", tags=["payouts"])
 api_router.include_router(reports_router, prefix="/reports", tags=["reports"])
@@ -65,6 +68,9 @@ api_router.include_router(webhooks_router, prefix="/webhooks", tags=["webhooks"]
 # — never a tenant or Super Admin JWT. See app/core/internal_auth.py. ----
 api_router.include_router(
     internal_disbursements_router, prefix="/internal", tags=["internal"]
+)
+api_router.include_router(
+    internal_collections_router, prefix="/internal", tags=["internal"]
 )
 
 # --- Earlier-phase surfaces, kept for the dashboard shell's existing calls --

@@ -23,6 +23,7 @@ from app.integrations.selcom.disbursement import SelcomDisbursementService
 from app.integrations.selcom.exceptions import SelcomAPIError, SelcomWebhookVerificationError
 from app.repositories.finance import PaymentWebhookRepository, WithdrawalRepository
 from app.services.captive_portal import selcom_config_from_settings
+from app.services.collections import CollectionService as CheckoutCollectionService
 from app.services.payouts import PayoutService
 
 logger = structlog.get_logger("webhooks.selcom")
@@ -151,3 +152,43 @@ async def selcom_disbursement_webhook(
 
     await db.commit()
     return {"status": result.status}
+
+
+@router.api_route("/selcom-collection/checkout", methods=["GET", "HEAD"])
+async def selcom_collection_checkout_webhook_reachability_check() -> dict[str, str]:
+    """Selcom's own portal is expected to probe a configured callback URL
+    (GET/HEAD) before accepting it — same reachability-check pattern as
+    /selcom-business/disbursement above, added there after a real
+    production incident (2026-09-19, see docs/architecture.md). Added
+    here proactively rather than waiting to discover the same gap live."""
+    return {"status": "ok"}
+
+
+@router.post("/selcom-collection/checkout")
+async def selcom_collection_checkout_webhook(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> dict[str, str]:
+    """Selcom Mobile Checkout's Collection callback — signed (Authorization/
+    Digest-Method/Digest/Timestamp/Signed-Fields), unlike the Business
+    Disbursement callback above, so this DOES verify a real signature
+    before acting — see app/integrations/selcom_collection/signing.py.
+    Even once verified, the webhook is only ever a SIGNAL to go query
+    order-status (an authenticated request this process signs itself) —
+    Selcom's own docs state the webhook fires only on successful
+    transactions and never signs amount/channel/phone, so those fields
+    are never trusted directly for crediting a wallet."""
+    body = await request.body()
+    headers = dict(request.headers)
+
+    service = CheckoutCollectionService(db)
+    try:
+        result = await service.process_webhook(headers=headers, body=body)
+    except Exception:  # noqa: BLE001 — never let a malformed/hostile inbound
+        # webhook take down this endpoint; always ack safely and rely on
+        # scheduled reconciliation to resolve the order instead.
+        await db.rollback()
+        logger.exception("selcom_collection.webhook_processing_error")
+        return {"status": "error"}
+
+    await db.commit()
+    return result

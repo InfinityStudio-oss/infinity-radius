@@ -1000,6 +1000,199 @@ one thing a reviewing Super Admin is allowed to know about 2FA state.
 
 SMS is out of scope — email via Resend is the only channel.
 
+## Selcom Mobile Checkout Collection architecture
+
+**Customer/subscriber payments into a tenant's wallet** via mobile-money
+STK push — `https://developers.selcommobile.com/` (`#authentication`,
+`#checkout-api`, `#create-order-minimal`,
+`#process-order-wallet-pull-payment`). Deliberately a completely separate
+integration from Selcom Business Disbursement above: own credentials
+(`SELCOM_COLLECTION_*`, never `SELCOM_BUSINESS_*`), own signing scheme,
+own client/config/errors/schemas package
+(`app/integrations/selcom_collection/`), own service
+(`app/services/collections.py`), own webhook route
+(`POST /api/v1/webhooks/selcom-collection/checkout`), own Celery task.
+Neither integration imports from the other. Per the operator, **no
+sandbox exists for these credentials** — every configured value is
+inherently production, unlike Disbursement's sandbox/production split.
+
+### Authentication
+
+Digest-based, not RSA-only like Business:
+
+```
+Authorization: SELCOM <Base64(api_key)>
+Timestamp:     ISO 8601 with a UTC offset, e.g. "2026-09-19T12:00:00+00:00"
+Digest-Method: HS256 | RS256
+Digest:        Base64(HMAC_SHA256(signing_string, api_secret))          [HS256]
+               Base64(RSA_SHA256_PKCS1v15(signing_string, private_key)) [RS256]
+Signed-Fields: comma-separated field names, in the exact order used to
+               build the signing string (timestamp is always implicit
+               and first, never itself listed)
+
+signing_string = f"timestamp={timestamp}&{field1}={value1}&{field2}={value2}..."
+```
+
+`app/integrations/selcom_collection/signing.py` implements both the
+outbound signer (`sign_request`, used by the client for every call) and
+the inbound verifier (`verify_webhook_request`, used only by the webhook
+route) — genuinely independent of `selcom_business/signing.py`, sharing
+only the underlying `cryptography.hazmat` RSA primitive conceptually,
+never a class or secret.
+
+**Documentation conflicts observed** (both worth an operator follow-up to
+Selcom support, neither blocks this implementation since the concrete
+worked examples resolve them unambiguously):
+
+1. **Signed-Fields sample vs. actual payload.** Both the
+   `create-order-minimal` and `webhook-callback` sections' sample headers
+   list a `Signed-Fields` value that doesn't match the fields shown in
+   that same section's own example payload. Resolved by following the
+   docs' own *stated rule* (Signed-Fields = the actual fields sent, in
+   the order sent) rather than copying an inconsistent sample.
+2. **Timestamp format.** The Authentication section's own worked example
+   uses full ISO 8601 with a UTC offset (`"2019-02-26T09:30:46+03:00"`);
+   every individual endpoint's curl sample instead shows the literal
+   placeholder `"{timestamp in yyyy-dd-mm H:i:s format}"` — a different,
+   non-ISO shape, and internally inconsistent even in its own field order
+   (`yyyy-dd-mm` is neither `Y-m-d` nor `d-m-Y`). Resolved by following
+   the Authentication section's concrete, unambiguous example; a
+   placeholder string is not evidence of a real format. UTC offset is
+   used specifically (not local time) to avoid DST/locale ambiguity —
+   the docs constrain the *shape*, not the *zone*.
+3. **`phone` vs `msisdn`.** `order-status`'s worked JSON example calls a
+   field `phone`; the field-description table directly below it calls
+   the same concept `msisdn`. `OrderStatusData` accepts both defensively
+   (`schemas.py`'s `_accept_msisdn_alias`), preferring `phone` if both are
+   somehow present, inventing neither.
+
+Two bugs were caught by the test suite before any credential was ever
+configured and fixed the same day (2026-09-19), both in
+`verify_webhook_request` and both would have made every genuinely valid
+webhook fail verification in production:
+
+- A stray, unconditional `raise SelcomCollectionAPIError(...)` left over
+  from copy-pasting `compute_digest_for_verification`'s
+  unsupported-digest-method branch sat after the real digest-match check,
+  so even a **correct** signature fell through to an unconditional raise
+  instead of returning. Caught by
+  `test_verify_webhook_request_accepts_a_genuinely_valid_signature`.
+- `app/api/v1/webhooks.py` builds `headers = dict(request.headers)` from
+  an ASGI `Request`, whose headers are always lowercase on the wire —
+  but `verify_webhook_request`'s header lookups used the exact-case
+  constants (`"Authorization"`, `"Timestamp"`, ...), so a real request's
+  headers would never match. Fixed by lowercasing both sides of every
+  lookup inside `verify_webhook_request`, so it works regardless of the
+  caller's header casing. Caught by
+  `test_verify_webhook_request_accepts_lowercase_header_keys`.
+
+### Two independent kill switches
+
+Mirrors `SELCOM_PRODUCTION_PAYOUTS_ENABLED`'s role for Disbursement, but
+as two gates instead of one, since Collection additionally needs a
+general "implemented and configured" switch distinct from "allowed to
+send a live STK":
+
+- `SELCOM_COLLECTION_ENABLED` — the general feature gate.
+- `SELCOM_COLLECTION_PRODUCTION_ENABLED` — the second gate; since no
+  sandbox exists, this is the only thing standing between "configured"
+  and "will actually push a real STK to a real phone."
+
+Both default `false`. `initiate_collection` checks both before ever
+constructing a `SelcomCollectionClient`. Credential validation itself
+(`SelcomCollectionConfig.require_configured`) is deliberately **lazy** —
+never checked at import/`app/main.py` startup time, unlike Disbursement's
+`validate_selcom_startup_config` — a direct response to the real
+2026-09-19 incident where a malformed Disbursement credential crashed the
+entire web service at boot. A bad Collection credential can now only ever
+break Collection requests, and only once `SELCOM_COLLECTION_ENABLED` is
+even on.
+
+### Flow
+
+1. `initiate_collection` (`POST /api/v1/collections`) creates a local
+   `Transaction` row first (status `CREATED`, globally-unique
+   `reference = f"col-{uuid4().hex}"` — generated before Selcom is ever
+   contacted, so a webhook can resolve it before the tenant is known),
+   then calls `create-order-minimal`, then immediately `wallet-payment`
+   (the actual STK/wallet-pull push) — in that order, so a failure at
+   either step leaves an honest, already-persisted `FAILED` row rather
+   than nothing. A successful `wallet-payment` response (resultcode
+   `111`) only means Selcom accepted the request; the transaction moves
+   to `STK_SENT`, never `COMPLETED`, at this point.
+2. **The wallet is only ever credited by one function**,
+   `CollectionService._apply_order_status`, and only ever from a value
+   this process obtained itself via its own authenticated
+   `GET /v1/checkout/order-status` call — never from an inbound webhook's
+   own claims. Finalization requires an **exact** match (no tolerance) on
+   `transid`, `order_id`, and `amount` against what this transaction
+   itself recorded; any mismatch moves the transaction to `AMBIGUOUS`
+   rather than crediting on a guess — the same
+   never-trust-a-callback's-own-claims principle as
+   `app/services/payouts.py`, deliberately non-negotiable from day one
+   given the real Disbursement amount-shape incident above. On a genuine
+   `COMPLETED` match, it calls the pre-existing, unmodified
+   `WalletService.process_collection` (no new ledger types invented) —
+   the same commission-split path every other collection already uses —
+   then transitions to `COMPLETED`.
+3. The webhook (`POST /api/v1/webhooks/selcom-collection/checkout`) is
+   signature-verified (see above) and, per Selcom's own docs, **only ever
+   fires on a successful transaction** — so it is used purely as a SIGNAL
+   to go run step 2's authenticated query, never as a source of truth for
+   failure/cancellation. An unverified signature is saved (audit trail)
+   but never acted on.
+4. `app/tasks/collections.py`'s
+   `infinity_radius.reconcile_pending_collections` Celery Beat task
+   (every 180s — Selcom's own general guidance to wait ~3 minutes before
+   polling an unresolved transaction) is the safety net for everything
+   else: `CREATED`/`STK_SENT`/`PENDING`/`INPROGRESS`/`AMBIGUOUS` orders
+   that never got a webhook at all (declined, cancelled, expired, lost
+   callback). Option B network centralization applies exactly as it does
+   for Disbursement: the worker holds zero Selcom Collection credentials
+   and never imports `app.integrations.selcom_collection` — it only
+   decides *which* orders need reconciliation (a pure DB read) and asks
+   web's own HMAC-authenticated internal endpoint
+   (`POST /internal/collections/reconcile`,
+   `app/api/v1/internal_collections.py`) to actually query Selcom, reusing
+   the same `InternalWebClient`/`INTERNAL_WORKER_WEB_HMAC_KEY` Disbursement
+   already uses — not a second internal secret.
+
+### Database
+
+`transactions` gained seven columns (migration
+`d155f04b789e_selcom_collection_columns`, `down_revision=9c1e5f4a2d7b`):
+`collection_transid`, `payer_phone`, `provider_resultcode`,
+`provider_message`, `stk_requested_at`, `completed_at`, `failed_at`, plus
+`status`'s server default changing from `"pending"` to `"CREATED"`. No new
+tables — the existing `transactions`/`payment_webhooks` tables were
+sufficient. **This migration has been applied to the local test database
+only, never to production** — it must be applied to Railway's production
+Postgres by an operator (`alembic upgrade head` against
+`DATABASE_URL`) before Collection can be used at all, independent of and
+prior to either kill switch being turned on.
+
+### Config variables (names only — see `.env.example`, never set here)
+
+`SELCOM_COLLECTION_BASE_URL`, `SELCOM_COLLECTION_API_KEY`,
+`SELCOM_COLLECTION_API_SECRET` (HS256), `SELCOM_COLLECTION_PRIVATE_KEY_B64`
+(RS256), `SELCOM_COLLECTION_DIGEST_METHOD`, `SELCOM_COLLECTION_VENDOR`,
+`SELCOM_COLLECTION_ENABLED`, `SELCOM_COLLECTION_PRODUCTION_ENABLED`. Web
+service only — never worker, beat, Vercel, the Network Agent, or
+MikroTik, and never a `NEXT_PUBLIC_SELCOM_COLLECTION_*` frontend variable
+(none should ever exist).
+
+### Status as of 2026-09-19
+
+Implemented and tested; **not live**. `SELCOM_COLLECTION_ENABLED` and
+`SELCOM_COLLECTION_PRODUCTION_ENABLED` are both unset (default `false`)
+everywhere, no real Selcom Collection credentials have been entered
+anywhere, no live connectivity test has been made, and no real STK push
+has ever been sent. The migration above has not been applied to
+production. Frontend UI for initiating/tracking a Collection (tenant
+dashboard) is not yet built — the API (`POST /api/v1/collections`,
+`GET /api/v1/collections/{id}`) exists and is tested, but nothing in
+`apps/web` calls it yet.
+
 ## Tenant dashboard
 
 The tenant dashboard landing page (`apps/web/app/dashboard/page.tsx`) is

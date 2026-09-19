@@ -230,6 +230,39 @@ class Settings(BaseSettings):
     # networking (e.g. "http://<RAILWAY_PRIVATE_DOMAIN>:8000"). Unset on web.
     internal_web_base_url: str | None = None
 
+    # --- Selcom Mobile Checkout Collection (customer -> platform payments,
+    # STK/wallet-pull push) — see app/integrations/selcom_collection/.
+    # developer.selcommobile.com — a DIFFERENT Selcom product from Business
+    # Disbursement above: different credentials, different signing scheme,
+    # never shared. Web-only, same least-privilege rule as Disbursement —
+    # never on the worker/beat. The operator has stated no separate test
+    # environment exists for these credentials, so there is no
+    # "SELCOM_COLLECTION_ENVIRONMENT" — only the two kill switches below.
+    selcom_collection_base_url: str | None = None
+    selcom_collection_api_key: str | None = None
+    # HS256 only — exactly one of this or the private key below is set,
+    # matching selcom_collection_digest_method.
+    selcom_collection_api_secret: str | None = None
+    # RS256 only — base64-encoded PEM, same convention as
+    # SELCOM_BUSINESS_PRIVATE_KEY_B64 (decode with base64.b64decode(...)).
+    selcom_collection_private_key_b64: str | None = None
+    # "HS256" | "RS256" — whichever Selcom actually issued; never guessed.
+    selcom_collection_digest_method: str | None = None
+    # Vendor/Merchant ID allocated by Selcom for Checkout (distinct from
+    # any Disbursement account number).
+    selcom_collection_vendor: str | None = None
+    # First gate: the general feature kill switch. False until the
+    # integration is implemented, tested, and credentials are configured.
+    selcom_collection_enabled: bool = False
+    # Second, independent gate: because there is no sandbox for these
+    # credentials, a real STK/wallet-pull is only ever sent when BOTH this
+    # AND selcom_collection_enabled are true — mirrors
+    # selcom_production_payouts_enabled's role for Disbursement. Query-only
+    # reconciliation of an already-created order is allowed while this is
+    # false; only NEW payment initiation (create-order/wallet-payment) is
+    # blocked.
+    selcom_collection_production_enabled: bool = False
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:

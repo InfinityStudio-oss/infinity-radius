@@ -3,14 +3,16 @@ processes, which import this module to obtain the same broker/backend
 configuration and task registry.
 
 Neither Worker nor Beat calls Selcom directly (Option B network
-centralization — see app/integrations/internal_web/client.py and
-app/api/v1/internal_disbursements.py): Beat only schedules, and Worker
-only decides which withdrawals need reconciliation and asks web's
-internal HMAC-authenticated endpoint to actually query Selcom. So this
-module deliberately never imports or calls
-app.integrations.selcom_business.config.validate_selcom_startup_config —
-Worker/Beat boot with zero Selcom credentials/awareness; only app/main.py
-(the web service) still validates them at startup.
+centralization — see app/integrations/internal_web/client.py,
+app/api/v1/internal_disbursements.py, app/api/v1/internal_collections.py):
+Beat only schedules, and Worker only decides which withdrawals/Collection
+orders need reconciliation and asks web's internal HMAC-authenticated
+endpoints to actually query Selcom. So this module deliberately never
+imports or calls
+app.integrations.selcom_business.config.validate_selcom_startup_config,
+nor anything from app.integrations.selcom_collection — Worker/Beat boot
+with zero Selcom credentials/awareness for EITHER integration; only
+app/main.py (the web service) ever holds either one's credentials.
 """
 
 from celery import Celery
@@ -23,7 +25,7 @@ celery_app = Celery(
     "infinity_radius",
     broker=str(settings.redis_url),
     backend=str(settings.redis_url),
-    include=["app.tasks.reconciliation"],
+    include=["app.tasks.reconciliation", "app.tasks.collections"],
 )
 
 celery_app.conf.update(
@@ -44,5 +46,12 @@ celery_app.conf.beat_schedule = {
     "reconcile-pending-withdrawals": {
         "task": "infinity_radius.reconcile_pending_withdrawals",
         "schedule": 120.0,
+    },
+    # 180s per Selcom's own general guidance to wait ~3 minutes before
+    # querying an unresolved transaction rather than polling aggressively
+    # — see app/tasks/collections.py.
+    "reconcile-pending-collections": {
+        "task": "infinity_radius.reconcile_pending_collections",
+        "schedule": 180.0,
     },
 }

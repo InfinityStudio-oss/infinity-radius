@@ -28,7 +28,7 @@ async def list_payments(
     service = PaymentService(db)
     items, total = await service.list(tenant_id=ctx.tenant_id, params=params)
     return ApiListResponse(
-        data=[TransactionRead.model_validate(item) for item in items],
+        data=[TransactionRead.from_transaction(item) for item in items],
         meta=build_pagination_meta(total=total, params=params),
     )
 
@@ -41,4 +41,4 @@ async def get_payment(
 ) -> ApiResponse[TransactionRead]:
     service = PaymentService(db)
     transaction = await service.get(tenant_id=ctx.tenant_id, transaction_id=transaction_id)
-    return ApiResponse(data=TransactionRead.model_validate(transaction))
+    return ApiResponse(data=TransactionRead.from_transaction(transaction))
