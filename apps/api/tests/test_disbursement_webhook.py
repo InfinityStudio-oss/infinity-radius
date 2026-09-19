@@ -61,6 +61,17 @@ def test_webhook_with_unimplemented_verification_saves_event_and_reports_unverif
     assert response.json() == {"status": "unverified"}
 
 
+def test_selcom_business_webhook_reachability_check_accepts_get_with_no_auth() -> None:
+    """Selcom's own portal probes the configured callback URL with a
+    GET/HEAD before accepting it as "verified" — separate from real
+    callback delivery, which is always POST. Must return 200 with no
+    auth required, or the portal reports the URL as unreachable even
+    though the real POST path works fine."""
+    response = client.get("/api/v1/webhooks/selcom-business/disbursement")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_selcom_business_webhook_with_unknown_reference_is_a_harmless_no_op() -> None:
     response = client.post(
         "/api/v1/webhooks/selcom-business/disbursement",

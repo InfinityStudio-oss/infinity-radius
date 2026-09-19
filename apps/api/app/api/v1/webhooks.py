@@ -58,6 +58,17 @@ async def selcom_collection_webhook(
     return {"status": result.status}
 
 
+@router.get("/selcom-business/disbursement")
+async def selcom_business_disbursement_webhook_reachability_check() -> dict[str, str]:
+    """Selcom's own portal probes the configured callback URL (GET/HEAD)
+    before accepting it as "verified" — a separate check from the real
+    callback delivery, which is always POST (see below) and does the
+    actual work. This does nothing but confirm the URL resolves to a
+    live 200 — no auth, no processing, no real callback ever arrives
+    this way."""
+    return {"status": "ok"}
+
+
 @router.post("/selcom-business/disbursement")
 async def selcom_business_disbursement_webhook(
     request: Request, db: AsyncSession = Depends(get_db)
