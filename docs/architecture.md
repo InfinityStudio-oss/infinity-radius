@@ -862,6 +862,79 @@ Super Admin dashboard, `GET /super-admin/reconciliation-health`, the
 withdrawal's own event history, the Selcom Business portal's own
 transaction view, and the wallet/ledger state.
 
+### Production incident: transaction/query amount includes the provider charge (2026-09-19)
+
+The first real production disbursement (TZS 5,000 principal, TZS 150
+Selcom transfer charge, both confirmed via the authenticated
+`account/lookup` call at submission time) was accepted by Selcom
+(`transaction/process` resultcode `111`, in progress) and later reported
+COMPLETED by an authenticated `transaction/query` (resultcode `000`) —
+but `data.amount` came back as **5150.00**, not the 5000.00 principal.
+The then-existing amount check compared only for exact equality against
+`withdrawal.amount` and correctly refused to finalize on trust, moving
+the withdrawal to `AMBIGUOUS` rather than guessing — funds stayed
+reserved, nothing was double-counted, no resubmission occurred.
+
+**Documented vs. observed Selcom semantics**: Selcom's public webhook
+callback documentation describes `amount` as the principal transfer
+amount, with `charges` returned as a separate field. `transaction/query`
+is only documented as returning a transaction amount, with no separate
+query-side charges field. The real production response did not match
+this — it appears (one observed transaction; not yet confirmed by
+Selcom support) that `transaction/query`'s `data.amount` can report the
+total debited amount (principal + Selcom's own transfer charge) rather
+than the principal alone.
+
+**Fix** (`app/services/payouts.py.match_provider_amount`,
+`app/core/enums.ProviderAmountMatch`): a finalization now succeeds only
+if the provider-reported amount is EXACTLY one of two forms — never a
+tolerance, percentage band, or `>=` comparison:
+
+- `PRINCIPAL_EXACT` — `provider_amount == withdrawal.amount`
+- `PRINCIPAL_PLUS_STORED_PROVIDER_CHARGE` — `provider_amount ==
+  withdrawal.amount + withdrawal.provider_charge`, where
+  `provider_charge` is *only* the value already stored on this specific
+  withdrawal from its own authenticated `account/lookup` at submission
+  time (`PayoutService._submit_to_selcom`) — never a charge asserted by
+  an inbound callback payload, never client-supplied, never freshly
+  computed. If `provider_charge` is unset, only the exact-principal form
+  is valid. A negative stored charge is never trusted either way.
+
+The withdrawal principal that gets finalized (the wallet debit,
+`total_disbursed`) is always `withdrawal.amount` — 5,000 in this case —
+never the provider-reported total, even when that total is what
+justified the match. The Selcom charge stays separately recorded on
+`withdrawal.provider_charge`; no platform policy exists yet to pass it
+on to the tenant.
+
+Two more fail-safe checks were added alongside it, in the same
+never-finalize-on-mismatch style: a **currency** check
+(`provider_currency == withdrawal.currency`) and a **transId** check
+(`provider_trans_id == withdrawal.idempotency_key`) — both defense in
+depth (this process only ever queries/submits using its own
+idempotency_key), both skipped (not enforced) when the provider response
+simply doesn't include that field, same as the pre-existing amount
+check's own behavior when no amount is returned at all.
+
+Which form matched is recorded on the `withdrawal.success` audit log
+entry (`metadata.amount_match`) — `PRINCIPAL_EXACT` or
+`PRINCIPAL_PLUS_STORED_PROVIDER_CHARGE` — so a real discrepancy stays
+auditable after the fact rather than silently absorbed.
+
+**Operator follow-up prepared for Selcom support** (not yet sent/answered
+— the fix does not depend on a response, since we have a real observed
+production transaction either way): *"GET /v1/transaction/query returned
+`data.amount` as principal + transfer charge for a COMPLETED
+disbursement, while the public callback documentation describes `amount`
+as the principal transfer amount excluding charges (with `charges`
+separate). Please confirm the intended semantic of
+`transaction/query`'s `data.amount` when transaction charges apply, and
+whether this differs from the callback payload's `amount` field."*
+
+**No schema migration was needed or made** — `withdrawals.provider_charge`
+already existed (populated since the original disbursement
+implementation) and was sufficient on its own.
+
 ### Withdrawal limit policy — operator decision required
 
 `WITHDRAWAL_MIN_AMOUNT_TZS`, `WITHDRAWAL_MAX_SINGLE_AMOUNT_TZS`,

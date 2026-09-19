@@ -115,6 +115,20 @@ class WithdrawalStatus(StrEnum):
     REVERSED = "REVERSED"  # a completed disbursement was later reversed
 
 
+class ProviderAmountMatch(StrEnum):
+    """Which exact form matched Selcom's reported transaction/query amount
+    against this withdrawal — recorded on finalization (see
+    app/services/payouts.py.match_provider_amount and _apply_provider_result)
+    so a real production discrepancy (Selcom's transaction/query amount
+    including its own charge, observed 2026-09-19 — see
+    docs/architecture.md) is auditable after the fact, never silently
+    absorbed. Never a loose/tolerance match — exactly one of these two
+    forms, or the withdrawal stays AMBIGUOUS."""
+
+    PRINCIPAL_EXACT = "PRINCIPAL_EXACT"
+    PRINCIPAL_PLUS_STORED_PROVIDER_CHARGE = "PRINCIPAL_PLUS_STORED_PROVIDER_CHARGE"
+
+
 # Terminal states — a withdrawal in one of these never transitions again.
 WITHDRAWAL_TERMINAL_STATUSES = frozenset(
     {

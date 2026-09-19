@@ -39,6 +39,7 @@ from app.core.enums import (
     DestinationCode,
     EmailEventStatus,
     EmailEventType,
+    ProviderAmountMatch,
     SettlementMode,
     WithdrawalStatus,
 )
@@ -113,6 +114,45 @@ def _otp_expired(withdrawal: Withdrawal) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
     return datetime.now(UTC) > expires_at
+
+
+def match_provider_amount(
+    *,
+    provider_amount: Decimal,
+    withdrawal_amount: Decimal,
+    stored_provider_charge: Decimal | None,
+) -> ProviderAmountMatch | None:
+    """The ONLY two shapes a Selcom transaction/query amount is ever
+    accepted as explaining this withdrawal — anything else must stay
+    AMBIGUOUS. Exact Decimal equality only; no tolerance, no percentage
+    band, no `>=`.
+
+    Discovered in real production (2026-09-19, see docs/architecture.md):
+    Selcom's transaction/query data.amount can report the principal PLUS
+    its own transfer charge (e.g. principal 5000.00 + charge 150.00 ->
+    reported 5150.00), even though the public callback documentation
+    describes "amount" as principal excluding charges. This helper adds
+    exactly that one additional accepted shape — never a broader "provider
+    amount is close enough" rule.
+
+    `stored_provider_charge` must be the charge THIS withdrawal already
+    recorded from its own authenticated Selcom account/lookup at
+    submission time (Withdrawal.provider_charge, set once in
+    PayoutService._submit_to_selcom) — never a charge asserted by an
+    inbound callback payload or any client-supplied value, both of which
+    are unauthenticated input an attacker (or a confused integration)
+    could set to whatever number makes a mismatch disappear. A negative
+    stored charge is never trusted either, however it got there."""
+    if provider_amount == withdrawal_amount:
+        return ProviderAmountMatch.PRINCIPAL_EXACT
+    if (
+        stored_provider_charge is not None
+        and stored_provider_charge >= 0
+        and provider_amount == withdrawal_amount + stored_provider_charge
+    ):
+        return ProviderAmountMatch.PRINCIPAL_PLUS_STORED_PROVIDER_CHARGE
+    return None
+
 
 logger = structlog.get_logger("services.payouts")
 
@@ -237,6 +277,7 @@ class PayoutService:
         to_status: WithdrawalStatus,
         actor_id: UUID | None,
         reason: str | None = None,
+        audit_metadata: dict[str, object] | None = None,
     ) -> None:
         from_status = withdrawal.status
         await self.repo.update(withdrawal, status=to_status.value)
@@ -248,6 +289,9 @@ class PayoutService:
             actor_id=actor_id,
             reason=reason,
         )
+        metadata: dict[str, object] = {"reason": reason} if reason else {}
+        if audit_metadata:
+            metadata.update(audit_metadata)
         await write_audit_log(
             self.db,
             tenant_id=withdrawal.tenant_id,
@@ -255,7 +299,7 @@ class PayoutService:
             action=f"withdrawal.{to_status.value.lower()}",
             target_type="withdrawal",
             target_id=withdrawal.id,
-            metadata={"reason": reason} if reason else None,
+            metadata=metadata or None,
         )
 
     async def _fail_withdrawal(
@@ -939,6 +983,8 @@ class PayoutService:
             provider_amount=(
                 money_from_provider(process_response.data.amount) if process_response.data else None
             ),
+            provider_currency=process_response.data.currency if process_response.data else None,
+            provider_trans_id=process_response.data.trans_id if process_response.data else None,
             provider_reference=(
                 process_response.data.selcom_receipt if process_response.data else None
             )
@@ -953,6 +999,8 @@ class PayoutService:
         resultcode: str | None,
         message: str | None,
         provider_amount: Decimal | None,
+        provider_currency: str | None = None,
+        provider_trans_id: str | None = None,
         provider_reference: str,
         actor_id: UUID | None,
     ) -> None:
@@ -970,11 +1018,61 @@ class PayoutService:
         parsed = interpret_resultcode(resultcode=resultcode, message=message)
 
         if parsed.outcome == SelcomResultOutcome.SUCCESS:
-            if provider_amount is not None and provider_amount != Decimal(withdrawal.amount):
-                # Amount mismatch is exactly the spoofed/corrupted-signal
-                # case this integration must never finalize on trust —
-                # flag for manual review instead of either finalizing or
-                # silently discarding it.
+            if provider_trans_id is not None and provider_trans_id != withdrawal.idempotency_key:
+                # Defense in depth: this process always queries/submits
+                # using this withdrawal's own idempotency_key as transId,
+                # so a mismatched transId in the response means something
+                # is wrong with the result itself — never finalize on it.
+                await self.repo.update(
+                    withdrawal,
+                    provider_result_code=parsed.resultcode,
+                    provider_message=f"transId mismatch: provider reported {provider_trans_id}",
+                )
+                await self._transition(
+                    withdrawal,
+                    to_status=WithdrawalStatus.AMBIGUOUS,
+                    actor_id=actor_id,
+                    reason="Provider-reported transId does not match this withdrawal's own",
+                )
+                return
+
+            if provider_currency is not None and provider_currency != withdrawal.currency:
+                # Fail-safe, same as an amount mismatch — never finalize a
+                # result reported in a different currency than this
+                # withdrawal was ever denominated in.
+                await self.repo.update(
+                    withdrawal,
+                    provider_result_code=parsed.resultcode,
+                    provider_message=f"Currency mismatch: provider reported {provider_currency}",
+                )
+                await self._transition(
+                    withdrawal,
+                    to_status=WithdrawalStatus.AMBIGUOUS,
+                    actor_id=actor_id,
+                    reason="Provider-reported currency does not match the withdrawal currency",
+                )
+                return
+
+            amount_match = (
+                match_provider_amount(
+                    provider_amount=provider_amount,
+                    withdrawal_amount=Decimal(withdrawal.amount),
+                    stored_provider_charge=(
+                        Decimal(withdrawal.provider_charge)
+                        if withdrawal.provider_charge is not None
+                        else None
+                    ),
+                )
+                if provider_amount is not None
+                else ProviderAmountMatch.PRINCIPAL_EXACT  # no amount reported to check at all
+            )
+            if amount_match is None:
+                # Neither an exact principal match nor principal + this
+                # withdrawal's own stored (authenticated-lookup) charge —
+                # exactly the spoofed/corrupted-signal case this
+                # integration must never finalize on trust — flag for
+                # manual review instead of either finalizing or silently
+                # discarding it. Never a loose/tolerance match.
                 await self.repo.update(
                     withdrawal,
                     provider_result_code=parsed.resultcode,
@@ -988,6 +1086,11 @@ class PayoutService:
                 )
                 return
 
+            # Always finalizes the withdrawal's own principal — never the
+            # provider-reported total even when that total is what
+            # justified the match (PRINCIPAL_PLUS_STORED_PROVIDER_CHARGE).
+            # The provider charge stays separately recorded on the
+            # withdrawal; no policy exists yet to pass it on to the tenant.
             await self.wallet_service.complete_disbursement(
                 tenant_id=withdrawal.tenant_id,
                 amount=Decimal(withdrawal.amount),
@@ -1002,7 +1105,11 @@ class PayoutService:
                 completed_at=datetime.now(UTC),
             )
             await self._transition(
-                withdrawal, to_status=WithdrawalStatus.SUCCESS, actor_id=actor_id, reason=message
+                withdrawal,
+                to_status=WithdrawalStatus.SUCCESS,
+                actor_id=actor_id,
+                reason=message,
+                audit_metadata={"amount_match": amount_match.value},
             )
         elif parsed.outcome == SelcomResultOutcome.INPROGRESS:
             # Stays PROCESSING — funds stay reserved, nothing finalized.
@@ -1063,6 +1170,8 @@ class PayoutService:
             resultcode=resultcode,
             message=query.message,
             provider_amount=money_from_provider(data.amount) if data else None,
+            provider_currency=data.currency if data else None,
+            provider_trans_id=data.trans_id if data else None,
             provider_reference=(data.selcom_receipt if data else None)
             or withdrawal.idempotency_key,
             actor_id=actor_id,
