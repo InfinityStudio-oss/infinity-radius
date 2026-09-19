@@ -72,6 +72,11 @@ def test_selcom_business_webhook_reachability_check_accepts_get_with_no_auth() -
     assert response.json() == {"status": "ok"}
 
 
+def test_selcom_business_webhook_reachability_check_accepts_head_with_no_auth() -> None:
+    response = client.head("/api/v1/webhooks/selcom-business/disbursement")
+    assert response.status_code == 200
+
+
 def test_selcom_business_webhook_with_unknown_reference_is_a_harmless_no_op() -> None:
     response = client.post(
         "/api/v1/webhooks/selcom-business/disbursement",

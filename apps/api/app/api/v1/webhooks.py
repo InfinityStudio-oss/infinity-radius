@@ -58,14 +58,15 @@ async def selcom_collection_webhook(
     return {"status": result.status}
 
 
-@router.get("/selcom-business/disbursement")
+@router.api_route("/selcom-business/disbursement", methods=["GET", "HEAD"])
 async def selcom_business_disbursement_webhook_reachability_check() -> dict[str, str]:
-    """Selcom's own portal probes the configured callback URL (GET/HEAD)
-    before accepting it as "verified" — a separate check from the real
-    callback delivery, which is always POST (see below) and does the
-    actual work. This does nothing but confirm the URL resolves to a
-    live 200 — no auth, no processing, no real callback ever arrives
-    this way."""
+    """Selcom's own portal probes the configured callback URL (GET and/or
+    HEAD — not documented which, so both are handled explicitly; Starlette
+    does not auto-add HEAD to a plain @router.get route) before accepting
+    it as "verified" — a separate check from the real callback delivery,
+    which is always POST (see below) and does the actual work. This does
+    nothing but confirm the URL resolves to a live 200 — no auth, no
+    processing, no real callback ever arrives this way."""
     return {"status": "ok"}
 
 
