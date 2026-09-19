@@ -135,18 +135,38 @@ class CollectionStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"  # cancelled before/without customer action
     USERCANCELLED = "USERCANCELLED"  # the customer declined the STK prompt
+    # Mapped defensively — NOT in Selcom's documented payment_status enum
+    # (PENDING/COMPLETED/CANCELLED/USERCANCELLED/REJECTED/INPROGRESS,
+    # re-confirmed against the live docs 2026-09-19). Handled in case a
+    # real/future response ever uses it, rather than falling through to
+    # AMBIGUOUS — see app/services/collections.py.
+    DECLINED = "DECLINED"
     REJECTED = "REJECTED"
     AMBIGUOUS = "AMBIGUOUS"  # provider result didn't safely match what we expected
-    EXPIRED = "EXPIRED"  # never resolved within the order's expiry window
+    # Mapped defensively, same rationale as DECLINED: Selcom's docs mention
+    # the CONCEPT of an expired order (Cancel Order: "An expired or
+    # completed order cannot be cancelled") but never document it as a
+    # payment_status value, nor state a default duration.
+    EXPIRED = "EXPIRED"
+    # Infinity Radius's OWN operational flag, never a Selcom-reported
+    # value: order-status has stayed PENDING/INPROGRESS past
+    # SELCOM_COLLECTION_PENDING_REVIEW_MINUTES. Deliberately NOT terminal
+    # (see COLLECTION_TERMINAL_STATUSES below) — reconciliation keeps
+    # polling it exactly as it does for PENDING.
+    REQUIRES_REVIEW = "REQUIRES_REVIEW"
 
 
 # Terminal states — a Collection order in one of these never transitions again.
+# REQUIRES_REVIEW is deliberately NOT terminal: it's an advisory flag over an
+# order-status that is still, per Selcom, non-terminal — the sweep must keep
+# querying it so a later genuine COMPLETED/CANCELLED/etc. can still resolve it.
 COLLECTION_TERMINAL_STATUSES = frozenset(
     {
         CollectionStatus.COMPLETED,
         CollectionStatus.FAILED,
         CollectionStatus.CANCELLED,
         CollectionStatus.USERCANCELLED,
+        CollectionStatus.DECLINED,
         CollectionStatus.REJECTED,
         CollectionStatus.EXPIRED,
     }

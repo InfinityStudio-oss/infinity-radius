@@ -262,6 +262,16 @@ class Settings(BaseSettings):
     # false; only NEW payment initiation (create-order/wallet-payment) is
     # blocked.
     selcom_collection_production_enabled: bool = False
+    # Infinity Radius's OWN operational review threshold — NOT a Selcom-
+    # documented timeout (Selcom's docs state no expiry/timeout for how
+    # long order-status may report PENDING/INPROGRESS; see
+    # docs/architecture.md's Collection section). Purely advisory: past
+    # this many minutes since stk_requested_at, a still-PENDING/INPROGRESS
+    # order is flagged CollectionStatus.REQUIRES_REVIEW for Super Admin/
+    # support visibility — never terminal, never blocks a later genuine
+    # provider result, never affects any wallet. <= 0 disables the flag
+    # entirely (falls back to the old PENDING/INPROGRESS-forever behavior).
+    selcom_collection_pending_review_minutes: int = 30
 
     @field_validator("cors_allow_origins", mode="before")
     @classmethod

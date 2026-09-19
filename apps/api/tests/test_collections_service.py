@@ -564,3 +564,451 @@ def test_list_reconcilable_collections_includes_stk_sent_and_ambiguous_but_not_t
         reconcilable_ids = asyncio.run(_list())
 
     assert stk_sent_id in reconcilable_ids
+
+
+# ------------------------------------------------------------------------
+# Status-handling hardening (2026-09-19): defensively-mapped DECLINED/
+# FAILED/EXPIRED, the documented USERCANCELED (single-L, webhook section)
+# spelling alias, and the local REQUIRES_REVIEW stale-PENDING flag. See
+# docs/architecture.md's Collection section for the full gap analysis —
+# these values are NOT confirmed Selcom behavior except where noted.
+
+
+def _backdate_stk_requested_at(
+    ctx: SeededContext, *, transaction_id: UUID, minutes_ago: int
+) -> None:
+    """Autocommit connection (see db_fixtures._connect) — takes effect
+    immediately, visible to the app's own separate async DB session."""
+    assert ctx._conn is not None
+    with ctx._conn.cursor() as cur:
+        cur.execute(
+            "UPDATE transactions SET stk_requested_at = now() - (%s * interval '1 minute') "
+            "WHERE id = %s",
+            (minutes_ago, str(transaction_id)),
+        )
+
+
+@pytest.mark.parametrize(
+    ("payment_status", "expected_status"),
+    [
+        ("DECLINED", CollectionStatus.DECLINED),
+        ("FAILED", CollectionStatus.FAILED),
+        ("EXPIRED", CollectionStatus.EXPIRED),
+        ("USERCANCELED", CollectionStatus.USERCANCELLED),  # single-L, webhook spelling
+    ],
+)
+def test_defensively_mapped_and_alias_statuses_finalize_terminal_without_crediting(
+    collection_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    payment_status: str,
+    expected_status: CollectionStatus,
+) -> None:
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status=payment_status
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            count = cur.fetchone()[0]
+
+    assert after.status == expected_status.value
+    assert count == 0
+
+
+def test_completed_with_mismatched_currency_never_credits(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selcom's documented order-status response carries no currency
+    field, so this check is normally inert — but if one ever appears and
+    disagrees with the transaction's own currency, it must block the
+    credit exactly like an amount mismatch does."""
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return OrderStatusResponse(
+                reference=reference,
+                resultcode="000",
+                result="SUCCESS",
+                data=[
+                    {
+                        "order_id": reference,
+                        "transid": transid,
+                        "amount": _AMOUNT,
+                        "payment_status": "COMPLETED",
+                        "currency": "USD",  # disagrees with the order's TZS
+                        "reference": f"RCPT-{transid}",
+                    }
+                ],
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            count = cur.fetchone()[0]
+
+    assert after.status == CollectionStatus.AMBIGUOUS.value
+    assert count == 0
+
+
+def test_completed_with_absent_currency_still_credits(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real-world shape: Selcom omits currency entirely — an absent
+    field must never be treated as a mismatch."""
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="COMPLETED"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            count = cur.fetchone()[0]
+
+    assert after.status == CollectionStatus.COMPLETED.value
+    assert count == 3
+
+
+def test_stale_pending_moves_to_requires_review_without_crediting(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "30")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=45)
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            count = cur.fetchone()[0]
+
+    get_settings.cache_clear()
+    assert after.status == CollectionStatus.REQUIRES_REVIEW.value
+    assert count == 0
+
+
+def test_pending_under_the_threshold_stays_pending_not_requires_review(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "30")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=5)
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+    get_settings.cache_clear()
+    assert after.status == CollectionStatus.PENDING.value
+
+
+def test_requires_review_remains_in_reconcilable_list(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "30")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=45)
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+        assert after.status == CollectionStatus.REQUIRES_REVIEW.value
+
+        async def _list() -> list[UUID]:
+            async with AsyncSessionLocal() as db:
+                service = CollectionService(db)
+                rows = await service.list_reconcilable_collections()
+                return [row.id for row in rows]
+
+        reconcilable_ids = asyncio.run(_list())
+
+    get_settings.cache_clear()
+    assert transaction_id in reconcilable_ids
+
+
+def test_repeated_pending_after_requires_review_does_not_re_flag(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No audit-log spam: once flagged, a still-PENDING result on a later
+    cycle is a pure no-op, not a repeated transition."""
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "30")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=45)
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        asyncio.run(_reconcile(transaction_id))  # second cycle, still PENDING
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM audit_logs WHERE target_id = %s AND action = "
+                "'collection.requires_review'",
+                (str(transaction_id),),
+            )
+            flag_count = cur.fetchone()[0]
+
+    get_settings.cache_clear()
+    assert flag_count == 1
+
+
+def test_requires_review_then_completed_credits_exactly_once(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "30")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=45)
+
+        async def _fake_pending(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_pending)
+        asyncio.run(_reconcile(transaction_id))
+        flagged = asyncio.run(_get_transaction(transaction_id))
+        assert flagged.status == CollectionStatus.REQUIRES_REVIEW.value
+
+        async def _fake_completed(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="COMPLETED"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_completed)
+        asyncio.run(_reconcile(transaction_id))
+        final = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            ledger_count = cur.fetchone()[0]
+
+    get_settings.cache_clear()
+    assert final.status == CollectionStatus.COMPLETED.value
+    assert ledger_count == 3
+
+
+def test_requires_review_then_terminal_failure_does_not_credit(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "30")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=45)
+
+        async def _fake_pending(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_pending)
+        asyncio.run(_reconcile(transaction_id))
+        flagged = asyncio.run(_get_transaction(transaction_id))
+        assert flagged.status == CollectionStatus.REQUIRES_REVIEW.value
+
+        async def _fake_usercancelled(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="USERCANCELLED"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_usercancelled)
+        asyncio.run(_reconcile(transaction_id))
+        final = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            ledger_count = cur.fetchone()[0]
+
+    get_settings.cache_clear()
+    assert final.status == CollectionStatus.USERCANCELLED.value
+    assert ledger_count == 0
+
+
+def test_pending_review_disabled_when_threshold_is_zero(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SELCOM_COLLECTION_PENDING_REVIEW_MINUTES", "0")
+    get_settings.cache_clear()
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        transid = transaction.collection_transid
+        reference = transaction.reference
+        assert transid is not None
+        _backdate_stk_requested_at(ctx, transaction_id=transaction_id, minutes_ago=999)
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference, transid=transid, amount=_AMOUNT, payment_status="PENDING"
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+    get_settings.cache_clear()
+    assert after.status == CollectionStatus.PENDING.value

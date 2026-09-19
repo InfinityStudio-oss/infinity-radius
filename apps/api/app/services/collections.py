@@ -22,7 +22,7 @@ here non-negotiable from day one rather than something to discover live.
 import base64
 import json
 from collections import OrderedDict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -39,9 +39,13 @@ from app.integrations.selcom_collection.config import selcom_collection_config_f
 from app.integrations.selcom_collection.constants import (
     PAYMENT_STATUS_CANCELLED,
     PAYMENT_STATUS_COMPLETED,
+    PAYMENT_STATUS_DECLINED_UNDOCUMENTED,
+    PAYMENT_STATUS_EXPIRED_UNDOCUMENTED,
+    PAYMENT_STATUS_FAILED_UNDOCUMENTED,
     PAYMENT_STATUS_INPROGRESS,
     PAYMENT_STATUS_PENDING,
     PAYMENT_STATUS_REJECTED,
+    PAYMENT_STATUS_USERCANCELED_WEBHOOK_SPELLING,
     PAYMENT_STATUS_USERCANCELLED,
 )
 from app.integrations.selcom_collection.errors import (
@@ -59,12 +63,28 @@ from app.services.wallet import WalletService
 logger = structlog.get_logger("services.collections")
 
 _PAYMENT_STATUS_TO_COLLECTION_STATUS: dict[str, CollectionStatus] = {
+    # Selcom-documented (order-status #get-order-status section).
     PAYMENT_STATUS_PENDING: CollectionStatus.PENDING,
     PAYMENT_STATUS_INPROGRESS: CollectionStatus.INPROGRESS,
     PAYMENT_STATUS_CANCELLED: CollectionStatus.CANCELLED,
     PAYMENT_STATUS_USERCANCELLED: CollectionStatus.USERCANCELLED,
     PAYMENT_STATUS_REJECTED: CollectionStatus.REJECTED,
+    # Selcom-documented, but only in the #webhook-callback section's own
+    # (differently-spelled) payment_status description — see constants.py.
+    PAYMENT_STATUS_USERCANCELED_WEBHOOK_SPELLING: CollectionStatus.USERCANCELLED,
+    # NOT part of Selcom's documented order-status enum — mapped
+    # defensively only, see constants.py's PAYMENT_STATUS_*_UNDOCUMENTED
+    # docstrings. If Selcom never actually sends these, this is inert.
+    PAYMENT_STATUS_DECLINED_UNDOCUMENTED: CollectionStatus.DECLINED,
+    PAYMENT_STATUS_FAILED_UNDOCUMENTED: CollectionStatus.FAILED,
+    PAYMENT_STATUS_EXPIRED_UNDOCUMENTED: CollectionStatus.EXPIRED,
 }
+
+# The two mapped local targets that mean "still waiting" — the only ones
+# eligible for the local stale-PENDING REQUIRES_REVIEW flag (see
+# CollectionService._is_stale_pending). Every other mapped value above is
+# already terminal and takes precedence unconditionally.
+_NON_TERMINAL_MAPPED_TARGETS = frozenset({CollectionStatus.PENDING, CollectionStatus.INPROGRESS})
 
 
 class CollectionService:
@@ -250,14 +270,38 @@ class CollectionService:
 
     # ------------------------------------------------------- finalization
 
+    def _is_stale_pending(self, transaction: Transaction) -> bool:
+        """True once a still-PENDING/INPROGRESS order has outlived
+        SELCOM_COLLECTION_PENDING_REVIEW_MINUTES since its STK was sent —
+        an Infinity Radius operational threshold, never presented as a
+        Selcom-documented timeout (Selcom's docs state none). <= 0
+        disables this entirely."""
+        threshold_minutes = get_settings().selcom_collection_pending_review_minutes
+        if threshold_minutes <= 0 or transaction.stk_requested_at is None:
+            return False
+        elapsed = datetime.now(UTC) - transaction.stk_requested_at
+        return elapsed >= timedelta(minutes=threshold_minutes)
+
     async def _apply_order_status(
-        self, transaction: Transaction, *, status_data: OrderStatusData, actor_id: UUID | None
+        self,
+        transaction: Transaction,
+        *,
+        status_data: OrderStatusData,
+        actor_id: UUID | None,
+        provider_resultcode: str | None = None,
     ) -> None:
         """The ONE place an authenticated order-status result is turned
         into a Transaction state change (and, on COMPLETED, a wallet
         credit) — reused by both the webhook path (which always queries
         first) and reconciliation, so there is exactly one amount/transid
-        validation implementation, never duplicated."""
+        validation implementation, never duplicated.
+
+        An explicit Selcom-mapped terminal status (CANCELLED/
+        USERCANCELLED/REJECTED, plus the defensively-mapped DECLINED/
+        FAILED/EXPIRED) always takes precedence and finalizes immediately,
+        even over a transaction previously flagged REQUIRES_REVIEW —
+        REQUIRES_REVIEW is only ever a waiting-room, never a status that
+        blocks a later authoritative result."""
         if transaction.status in COLLECTION_TERMINAL_STATUSES:
             return  # already resolved — idempotent no-op
 
@@ -292,6 +336,19 @@ class CollectionService:
                     reason=f"Amount mismatch: provider reported {status_data.amount}",
                 )
                 return
+            # Defensive and currently inert: Selcom's documented order-status
+            # response carries no currency field at all (see schemas.py), so
+            # this only ever fires if one appears. Same skip-when-absent shape
+            # as the transid/order_id checks above — an absent field is never
+            # treated as a mismatch, and a present mismatch never credits.
+            if status_data.currency and status_data.currency != transaction.currency:
+                await self._transition(
+                    transaction,
+                    to_status=CollectionStatus.AMBIGUOUS,
+                    actor_id=actor_id,
+                    reason=f"Currency mismatch: provider reported {status_data.currency}",
+                )
+                return
 
             await self.wallet_service.process_collection(
                 tenant_id=transaction.tenant_id,
@@ -307,31 +364,68 @@ class CollectionService:
                 reason="Payment verified COMPLETED via authenticated order-status query",
                 provider_reference=status_data.reference or transaction.provider_reference,
                 channel=status_data.channel,
-                provider_resultcode="000",
+                provider_resultcode=provider_resultcode or "000",
                 provider_message="COMPLETED",
                 completed_at=datetime.now(UTC),
             )
             return
 
-        if payment_status in _PAYMENT_STATUS_TO_COLLECTION_STATUS:
-            new_status = _PAYMENT_STATUS_TO_COLLECTION_STATUS[payment_status]
-            is_terminal = new_status in COLLECTION_TERMINAL_STATUSES
+        mapped_status = _PAYMENT_STATUS_TO_COLLECTION_STATUS.get(payment_status)
+        if mapped_status is None:
+            # Unknown payment_status — never assumed safe, never credited,
+            # never silently collapsed into PENDING.
             await self._transition(
                 transaction,
-                to_status=new_status,
+                to_status=CollectionStatus.AMBIGUOUS,
                 actor_id=actor_id,
-                reason=f"Selcom order-status: {payment_status}",
-                provider_message=payment_status,
-                failed_at=datetime.now(UTC) if is_terminal else None,
+                reason=f"Unrecognized payment_status: {status_data.payment_status!r}",
+                provider_resultcode=provider_resultcode,
             )
             return
 
-        # Unknown payment_status — never assumed safe, never credited.
+        if mapped_status not in _NON_TERMINAL_MAPPED_TARGETS:
+            # An explicit Selcom-mapped terminal state always wins,
+            # regardless of whether this transaction was previously
+            # flagged REQUIRES_REVIEW.
+            await self._transition(
+                transaction,
+                to_status=mapped_status,
+                actor_id=actor_id,
+                reason=f"Selcom order-status: {payment_status}",
+                provider_message=payment_status,
+                provider_resultcode=provider_resultcode,
+                failed_at=datetime.now(UTC),
+            )
+            return
+
+        # Still non-terminal per Selcom (PENDING/INPROGRESS-mapped).
+        if transaction.status == CollectionStatus.REQUIRES_REVIEW.value:
+            return  # already flagged — no-op, stays reconcilable, no audit spam
+
+        if self._is_stale_pending(transaction):
+            await self._transition(
+                transaction,
+                to_status=CollectionStatus.REQUIRES_REVIEW,
+                actor_id=actor_id,
+                reason=(
+                    f"Provider order-status has remained {payment_status!r} past the local "
+                    "SELCOM_COLLECTION_PENDING_REVIEW_MINUTES threshold — an Infinity Radius "
+                    "operational flag for Super Admin/support visibility, never a Selcom-"
+                    "reported status. Still fully reconcilable; a later genuine COMPLETED or "
+                    "terminal result finalizes normally."
+                ),
+                provider_message=payment_status,
+                provider_resultcode=provider_resultcode,
+            )
+            return
+
         await self._transition(
             transaction,
-            to_status=CollectionStatus.AMBIGUOUS,
+            to_status=mapped_status,
             actor_id=actor_id,
-            reason=f"Unrecognized payment_status: {status_data.payment_status!r}",
+            reason=f"Selcom order-status: {payment_status}",
+            provider_message=payment_status,
+            provider_resultcode=provider_resultcode,
         )
 
     async def query_and_apply(self, *, transaction: Transaction, actor_id: UUID | None) -> None:
@@ -349,9 +443,27 @@ class CollectionService:
                 error=str(exc),
             )
             return
+        # Sanitized (no secrets/signed headers) — the wrapper-level fields
+        # a raw order-status response carries beyond the per-item data
+        # Selcom docs describe as "Available on COMPLETED payments only"
+        # for transid/channel/reference/msisdn; logged here since these
+        # aren't persisted to a column for non-COMPLETED responses.
+        logger.info(
+            "collections.order_status_queried",
+            transaction_id=str(transaction.id),
+            resultcode=response.resultcode,
+            result=response.result,
+            message=response.message,
+            payment_status=response.first.payment_status if response.first else None,
+        )
         if response.first is None:
             return
-        await self._apply_order_status(transaction, status_data=response.first, actor_id=actor_id)
+        await self._apply_order_status(
+            transaction,
+            status_data=response.first,
+            actor_id=actor_id,
+            provider_resultcode=response.resultcode,
+        )
 
     async def reconcile(self, *, transaction_id: UUID) -> Transaction:
         """Public entry point for both the Super Admin-visible internal

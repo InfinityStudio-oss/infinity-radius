@@ -92,6 +92,13 @@ class OrderStatusData(BaseModel):
     # directly below it calls the same concept "msisdn" — both keys are
     # accepted defensively via the validator below; neither is invented.
     phone: str | None = None
+    # NOT part of Selcom's documented order-status response (its documented
+    # data fields are order_id/creation_date/amount/payment_status/transid/
+    # channel/reference/msisdn — re-confirmed 2026-09-19). Parsed only so
+    # that IF a response ever does carry it, app/services/collections.py can
+    # verify it against the transaction's own currency before crediting,
+    # rather than ignoring a mismatch. Inert while Selcom omits it.
+    currency: str | None = None
 
     _normalize_amount = field_validator("amount", mode="before")(
         lambda v: money_from_provider(v) if v is not None else None

@@ -1181,6 +1181,70 @@ service only — never worker, beat, Vercel, the Network Agent, or
 MikroTik, and never a `NEXT_PUBLIC_SELCOM_COLLECTION_*` frontend variable
 (none should ever exist).
 
+### Collection status model — hardened after the first live test (2026-09-19)
+
+The first controlled live Collection test (TZS 1,000 to an operator-owned
+phone) had the payer deliberately delay the PIN and then **decline** the
+STK prompt. Selcom's authenticated `order-status` nevertheless kept
+returning `PENDING` for 45+ minutes across 14 reconciliation cycles — it
+never transitioned to any terminal state. No wallet was credited at any
+point (correct), but the order would have sat `PENDING` indefinitely.
+
+**What the official docs do and don't say** (re-fetched and re-read
+2026-09-19, raw HTML rather than a summarizer):
+
+- `order-status`'s documented `payment_status` set is exactly
+  `PENDING, COMPLETED, CANCELLED, USERCANCELLED, REJECTED, INPROGRESS`.
+  There is no `DECLINED`, `FAILED`, `EXPIRED`, or `TIMEOUT` value.
+- **No timeout/expiry is documented** for the wallet-payment/STK step, or
+  for how long `order-status` may keep reporting `PENDING`.
+- `create-order-minimal` *does* document an **optional `expiry`
+  parameter ("Expiry in minutes", example `60`)** — which this
+  integration currently never sends. What Selcom's default is when it is
+  omitted is not documented.
+- The `Cancel Order` endpoint (`DELETE /v1/checkout/cancel-order`, also
+  not yet implemented here) states *"An expired or completed order cannot
+  be cancelled"* — so the concept of an expired order exists on Selcom's
+  side, even though it is not a documented `payment_status` value.
+- **Real spelling inconsistency in Selcom's own docs**: the
+  `#get-order-status` section spells it `USERCANCELLED` (double L); the
+  `#webhook-callback` section spells the same concept `USERCANCELED`
+  (single L). Both are now accepted, mapping to the same local status.
+
+**What changed here** (`app/core/enums.py`, `app/services/collections.py`,
+`app/integrations/selcom_collection/constants.py`):
+
+- Added local `CollectionStatus.DECLINED` (terminal) and mapped
+  `DECLINED`/`FAILED`/`EXPIRED` **defensively** — clearly marked in code
+  as NOT documented Selcom values, so that if a real response ever uses
+  one it finalizes cleanly instead of falling through to `AMBIGUOUS`.
+  Inert if Selcom never sends them.
+- An explicitly-mapped terminal provider status now always wins, even
+  over a transaction previously flagged for review.
+- A genuinely unrecognized `payment_status` still becomes `AMBIGUOUS` —
+  never silently collapsed into `PENDING`, never credited.
+- Added `CollectionStatus.REQUIRES_REVIEW`: an **Infinity Radius
+  operational flag**, not a Selcom status. Once a still-PENDING/
+  INPROGRESS order outlives `SELCOM_COLLECTION_PENDING_REVIEW_MINUTES`
+  (default 30, `0` disables), it is flagged once, audit-logged, and left
+  **deliberately non-terminal** — so the sweep keeps polling and a later
+  genuine `COMPLETED` or terminal failure still resolves it normally.
+  It can never cause a wallet credit.
+- `order-status`'s wrapper-level `resultcode`/`result`/`message` are now
+  logged (sanitized — never headers, keys, or signatures) on every query
+  and persisted to `provider_resultcode`, closing the observability gap
+  found while assembling the first support-escalation package.
+
+**No database migration was required** — `transactions.status` is a plain
+`Text` column with no CHECK constraint, so new status values need no
+schema change.
+
+**Open question with Selcom support** (not blocking): why does
+`order-status` stay `PENDING` long after an explicit payer decline, what
+terminal status should integrators expect, what is the default `expiry`
+when the parameter is omitted, and does an expired order ever surface a
+distinct `payment_status`?
+
 ### Status as of 2026-09-19
 
 Implemented and tested; **not live**. `SELCOM_COLLECTION_ENABLED` and
