@@ -20,7 +20,12 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.enums import LedgerEntryType, VoucherStatus
+from app.core.enums import (
+    COLLECTION_TERMINAL_STATUSES,
+    CollectionStatus,
+    LedgerEntryType,
+    VoucherStatus,
+)
 from app.models.finance import LedgerEntry, TenantWallet, Transaction
 from app.models.network import OfflineVoucher, Package, Router, Subscription, UserSession
 from app.schemas.dashboard import CollectionsTrendPoint, PackagePerformanceRow, SessionTrendPoint
@@ -44,6 +49,16 @@ class DashboardSummary:
     routers_total: int
     failed_transactions: int
     available_wallet_balance_tzs: Decimal
+
+
+# Terminal-but-unsuccessful transaction statuses — one definition shared
+# with reconciliation (COLLECTION_TERMINAL_STATUSES) so a newly added
+# status cannot silently drop out of the operational "failed today" count.
+_FAILED_TRANSACTION_STATUSES = frozenset(
+    status.value
+    for status in COLLECTION_TERMINAL_STATUSES
+    if status is not CollectionStatus.COMPLETED
+)
 
 
 class DashboardService:
@@ -95,7 +110,13 @@ class DashboardService:
             .select_from(Transaction)
             .where(
                 Transaction.tenant_id == tenant_id,
-                Transaction.status == "failed",
+                # Every terminal-but-not-successful status, from the same
+                # definition reconciliation uses. This previously compared
+                # against a lowercase "failed" that NO writer has produced
+                # since Collection landed, so the count was always 0 — and
+                # unifying captive-portal statuses onto CollectionStatus
+                # would have made it permanently 0 for both families.
+                Transaction.status.in_(_FAILED_TRANSACTION_STATUSES),
                 Transaction.created_at >= today_start,
             )
         )
@@ -180,8 +201,14 @@ class DashboardService:
 
     async def package_performance(self, *, tenant_id: UUID) -> list[PackagePerformanceRow]:
         active_count = func.count(Subscription.id).filter(Subscription.status == "ACTIVE")
+        # Uppercase COMPLETED, matching what both writers actually store.
+        # The previous lowercase comparison matched nothing, so per-package
+        # revenue silently reported 0 for every package.
         revenue = func.coalesce(
-            func.sum(Transaction.amount).filter(Transaction.status == "completed"), 0
+            func.sum(Transaction.amount).filter(
+                Transaction.status == CollectionStatus.COMPLETED.value
+            ),
+            0,
         )
 
         stmt = (

@@ -112,11 +112,16 @@ def test_summary_reflects_real_rows() -> None:
         )
         assert wallet_response.status_code == 201
 
-        # A real failed transaction.
+        # A real failed transaction. Uppercase CollectionStatus, which is
+        # what both writers actually persist — the lowercase spelling this
+        # previously used was a value no writer has ever produced, so the
+        # dashboard's own lowercase comparison matched it and the pair
+        # agreed with each other while both disagreed with production.
         with ctx._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO transactions (tenant_id, reference, amount, currency, status) "
-                "VALUES (%s, %s, %s, 'TZS', 'failed')",
+                "INSERT INTO transactions "
+                "(tenant_id, reference, amount, currency, status, transaction_type) "
+                "VALUES (%s, %s, %s, 'TZS', 'FAILED', 'COLLECTION')",
                 (str(tenant_id), "DASH-FAILED-1", "250.00"),
             )
 
@@ -247,10 +252,13 @@ def test_package_performance_reports_real_subscription_and_revenue_aggregates() 
                 "VALUES (%s, %s, %s, 'EXPIRED')",
                 (str(tenant_id), customer_id, package_id),
             )
+            # Uppercase COMPLETED — see the note in
+            # test_summary_reflects_real_rows above.
             cur.execute(
                 "INSERT INTO transactions "
-                "(tenant_id, subscription_id, reference, amount, currency, status) "
-                "VALUES (%s, %s, %s, %s, 'TZS', 'completed')",
+                "(tenant_id, subscription_id, reference, amount, currency, status, "
+                "transaction_type) "
+                "VALUES (%s, %s, %s, %s, 'TZS', 'COMPLETED', 'COLLECTION')",
                 (str(tenant_id), str(subscription_id), "DASH-PKG-PERF-1", "1500.00"),
             )
 

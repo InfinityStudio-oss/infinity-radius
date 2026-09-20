@@ -25,7 +25,15 @@ celery_app = Celery(
     "infinity_radius",
     broker=str(settings.redis_url),
     backend=str(settings.redis_url),
-    include=["app.tasks.reconciliation", "app.tasks.collections"],
+    include=[
+        "app.tasks.reconciliation",
+        "app.tasks.collections",
+        # Registered but deliberately NOT in beat_schedule below: no
+        # captive payment can reach a provider yet, so there is nothing
+        # to retry. Registering it now means the recovery path exists
+        # and is tested before the flow that needs it goes live.
+        "app.tasks.captive_activation",
+    ],
 )
 
 celery_app.conf.update(

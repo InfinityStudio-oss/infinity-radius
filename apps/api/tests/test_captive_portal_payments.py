@@ -18,6 +18,7 @@ from app.core.config import get_settings
 from app.core.transaction_token import resolve_transaction_token
 from app.db.session import AsyncSessionLocal
 from app.main import app
+from app.services.captive_activation import run_activation
 from app.services.captive_portal import CaptivePortalService
 from tests.auth_helpers import auth_header
 from tests.db_fixtures import SeededContext
@@ -46,12 +47,18 @@ def _cleanup_radius(*, username: str, package_id: str) -> None:
     conn.close()
 
 
-async def _mark_completed_directly(transaction_id: UUID) -> None:
-    """Stands in for the payment provider that captive-portal payments
-    are not yet wired to — see this file's module docstring."""
+async def _pay_and_activate(transaction_id: UUID) -> None:
+    """Stands in for the payment provider that captive-portal payments are
+    not yet wired to — see this file's module docstring.
+
+    Runs the two steps the way production will: the payment is finalized
+    and COMMITTED first, then activation runs in its own transaction via
+    run_activation(). They are deliberately never in the same transaction
+    (see app/services/captive_activation.py)."""
     async with AsyncSessionLocal() as db:
-        await CaptivePortalService(db).mark_transaction_completed(transaction_id=transaction_id)
+        await CaptivePortalService(db).finalize_payment(transaction_id=transaction_id)
         await db.commit()
+    await run_activation(transaction_id=transaction_id)
 
 
 def _create_router_and_package(headers: dict[str, str]) -> tuple[str, str]:
@@ -291,11 +298,11 @@ def test_full_payment_flow_reaches_completed_with_radius_credentials() -> None:
         try:
             # Stands in for the Selcom webhook this codebase can't
             # implement yet (see app/services/captive_portal.py's module
-            # docstring) — drives the real activation/RADIUS-provisioning
-            # path directly. Must run before SeededContext's teardown
+            # docstring) — drives the real finalize-then-activate path
+            # directly. Must run before SeededContext's teardown
             # (which cascades-deletes the tenant this transaction belongs
             # to), so it stays inside this `with` block.
-            asyncio.run(_mark_completed_directly(transaction_id))
+            asyncio.run(_pay_and_activate(transaction_id))
 
             completed_status = client.get(
                 "/api/v1/public/captive-portal/payments/status",

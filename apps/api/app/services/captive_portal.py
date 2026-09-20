@@ -23,17 +23,25 @@ from tests, since nothing yet initiates a real captive-portal payment.
 """
 
 import secrets
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import PackageStatus, PaymentProvider, TransactionType
+from app.core.enums import (
+    COLLECTION_TERMINAL_STATUSES,
+    ActivationStatus,
+    CollectionStatus,
+    PackageStatus,
+    PaymentProvider,
+    TransactionType,
+)
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.money import DEFAULT_CURRENCY
 from app.core.transaction_token import create_transaction_token, resolve_transaction_token
-from app.models.network import Customer, Package, Subscription
+from app.models.network import Customer
 from app.repositories.billing import PackageRepository
 from app.repositories.finance import TransactionRepository
 from app.repositories.network import RouterRepository
@@ -47,8 +55,6 @@ from app.services.audit import write_audit_log
 from app.services.customers import CustomerService
 from app.services.radius_sync import (
     derive_radius_password,
-    provision_customer_radius_access,
-    sync_package_radius_group,
 )
 from app.services.selcom_payment_provider import SelcomPaymentFlow
 from app.services.subscriptions import SubscriptionService
@@ -70,6 +76,20 @@ from app.services.wallet import WalletService
 # body. Writing SELCOM_COLLECTION on a row that never reached Selcom would
 # fabricate history AND make the sweep query order-status for an order_id
 # that was never created.
+# Which stored CollectionStatus values the customer-facing portal shows as
+# "failed". Derived from COLLECTION_TERMINAL_STATUSES minus COMPLETED, so a
+# status added there can never silently project to "pending" forever and
+# leave a customer watching a spinner for a payment that already died.
+# REQUIRES_REVIEW and AMBIGUOUS are deliberately NOT here: they are still
+# being reconciled, and telling someone their payment failed while it may
+# yet settle is how you get charged-but-told-it-failed complaints.
+_PUBLIC_FAILED_STATUSES = frozenset(
+    status.value
+    for status in COLLECTION_TERMINAL_STATUSES
+    if status is not CollectionStatus.COMPLETED
+)
+
+
 CAPTIVE_PORTAL_SELCOM_FLOW = SelcomPaymentFlow(
     transaction_type=TransactionType.CAPTIVE_PORTAL,
     payment_provider=PaymentProvider.SELCOM_COLLECTION,
@@ -142,7 +162,12 @@ class CaptivePortalService:
             channel="captive_portal",
             amount=str(amount),
             currency=DEFAULT_CURRENCY,
-            status="pending",
+            # CollectionStatus, not the old lowercase "pending": one
+            # vocabulary for both payment families, so a single reconciler
+            # and a single set of terminal-status rules cover both. CREATED
+            # is the accurate starting point — the row exists locally and
+            # nothing has been sent to any provider.
+            status=CollectionStatus.CREATED.value,
         )
 
         # No provider is wired up for captive-portal payments yet, so no
@@ -191,9 +216,18 @@ class CaptivePortalService:
         if transaction is None:
             return CaptivePortalPaymentStatusResult(status="not_found")
 
-        if transaction.status != "completed":
-            status = transaction.status if transaction.status == "failed" else "pending"
-            return CaptivePortalPaymentStatusResult(status=status)
+        # The stored vocabulary is CollectionStatus; the public one is a
+        # deliberately coarse projection of it. Customers get "is my money
+        # gone / am I online / should I try again", never the provider's
+        # internal state machine. Anything unrecognised projects to
+        # "pending" — never to success.
+        if transaction.status != CollectionStatus.COMPLETED.value:
+            public = (
+                "failed"
+                if transaction.status in _PUBLIC_FAILED_STATUSES
+                else "pending"
+            )
+            return CaptivePortalPaymentStatusResult(status=public)
 
         if transaction.subscription_id is None or transaction.customer_id is None:
             return CaptivePortalPaymentStatusResult(status="completed")
@@ -205,53 +239,63 @@ class CaptivePortalService:
         if customer is None:
             return CaptivePortalPaymentStatusResult(status="completed")
 
+        # Credentials are handed over only once access actually exists.
+        # A paid-but-not-yet-activated customer gets "completed" without
+        # them rather than credentials that FreeRADIUS would reject.
+        if transaction.activation_status != ActivationStatus.ACTIVE.value:
+            return CaptivePortalPaymentStatusResult(status="completed")
+
         return CaptivePortalPaymentStatusResult(
             status="completed",
             login_username=customer.phone,
             login_password=derive_radius_password(transaction.subscription_id),
         )
 
-    async def mark_transaction_completed(self, *, transaction_id: UUID) -> None:
-        """Finalizes one captive-portal payment: activates the
-        subscription, credits the tenant's wallet, provisions RADIUS
-        access, and writes the audit trail — all real, all tested.
+    async def finalize_payment(self, *, transaction_id: UUID) -> None:
+        """Finalizes the MONEY for one captive-portal payment, and nothing
+        else. Row-locked and idempotent.
 
-        Guarded by the `status != "pending"` check below so a repeated
-        call can never double-activate or double-credit. No production
-        caller reaches this yet; when captive-portal payments are wired
-        to SelcomPaymentProvider, this becomes that flow's
-        `finalize_payment`, invoked only after an authenticated
-        order-status query has verified the payment COMPLETED.
+        Deliberately does NOT activate the subscription or provision
+        RADIUS — see app/services/captive_activation.py. Those run in a
+        SEPARATE transaction opened after this one commits, so that a
+        FreeRADIUS outage can never roll back a payment the customer has
+        genuinely made. Splitting them is the whole point: a verified
+        COMPLETED payment must never become a failure because access
+        provisioning failed.
+
+        Marks activation_status=PENDING so the payment is immediately
+        visible to the retry sweep even if the process dies before
+        activation is attempted.
+
+        Accounting is identical to the tenant Collection flow: the same
+        WalletService.process_collection, the same commercial terms, the
+        same three ledger entries.
         """
-        transaction = await self.transaction_repo.get_by_id(tenant_id=None, id=transaction_id)
+        transaction = await self.transaction_repo.get_by_id_for_update(
+            tenant_id=None, id=transaction_id
+        )
         if transaction is None:
             raise NotFoundError("Transaction not found")
-        if transaction.status != "pending":
-            return  # already processed — idempotent, never double-activate
+
+        if transaction.status == CollectionStatus.COMPLETED.value:
+            return  # already finalized — never credit the wallet twice
+
+        # Only a non-terminal payment may be finalized. A CANCELLED or
+        # FAILED row must never be resurrected into a credit.
+        if transaction.status in _PUBLIC_FAILED_STATUSES:
+            raise DomainValidationError(
+                f"Cannot finalize a payment already terminal in status {transaction.status}"
+            )
 
         if transaction.subscription_id is None or transaction.customer_id is None:
             raise DomainValidationError("Transaction has no associated subscription/customer")
 
-        subscription_result = await self.db.execute(
-            select(Subscription).where(Subscription.id == transaction.subscription_id)
-        )
-        subscription = subscription_result.scalar_one_or_none()
-        if subscription is None:
-            raise NotFoundError("Subscription not found")
-
-        customer_result = await self.db.execute(
-            select(Customer).where(Customer.id == transaction.customer_id)
-        )
-        customer = customer_result.scalar_one()
-
-        package_result = await self.db.execute(
-            select(Package).where(Package.id == subscription.package_id)
-        )
-        package = package_result.scalar_one()
-
-        await self.transaction_repo.update(transaction, status="completed")
-        subscription = await SubscriptionService(self.db).activate(
-            tenant_id=transaction.tenant_id, actor_id=None, subscription_id=subscription.id
+        await self.transaction_repo.update(
+            transaction,
+            status=CollectionStatus.COMPLETED.value,
+            completed_at=datetime.now(UTC),
+            # Paid, access not yet granted. The retry sweep picks this up.
+            activation_status=ActivationStatus.PENDING.value,
         )
 
         await WalletService(self.db).process_collection(
@@ -262,21 +306,6 @@ class CaptivePortalService:
             description=f"Captive portal payment {transaction.reference}",
         )
 
-        await sync_package_radius_group(
-            package_id=package.id,
-            download_speed_kbps=package.download_speed_kbps,
-            upload_speed_kbps=package.upload_speed_kbps,
-            session_timeout_seconds=(
-                package.duration_minutes * 60 if package.duration_minutes else None
-            ),
-            simultaneous_sessions=package.simultaneous_sessions,
-        )
-        await provision_customer_radius_access(
-            customer_phone=customer.phone,
-            package_id=package.id,
-            radius_password=derive_radius_password(subscription.id),
-        )
-
         await write_audit_log(
             self.db,
             tenant_id=transaction.tenant_id,
@@ -284,5 +313,5 @@ class CaptivePortalService:
             action="captive_portal.payment_completed",
             target_type="transaction",
             target_id=transaction.id,
-            metadata={"subscription_id": str(subscription.id)},
+            metadata={"subscription_id": str(transaction.subscription_id)},
         )
