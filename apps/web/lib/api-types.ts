@@ -101,6 +101,15 @@ export interface TransactionRead {
   stk_requested_at: string | null;
   completed_at: string | null;
   failed_at: string | null;
+  /** Which business flow created this row — COLLECTION or CAPTIVE_PORTAL.
+   *  Never which provider settled it; that is payment_provider. */
+  transaction_type?: string | null;
+  payment_provider?: string | null;
+  /** ACCESS, not money. A row can be COMPLETED with activation FAILED. */
+  activation_status?: string | null;
+  activated_at?: string | null;
+  package_id?: string | null;
+  router_id?: string | null;
   created_at: string;
   updated_at: string;
 }

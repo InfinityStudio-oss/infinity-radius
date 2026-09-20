@@ -25,6 +25,13 @@ class TransactionRead(BaseModel):
     customer_id: UUID | None
     subscription_id: UUID | None
     reference: str
+    # Which BUSINESS FLOW this row belongs to — COLLECTION (a staff
+    # member requested it) or CAPTIVE_PORTAL (a customer bought a
+    # package at a hotspot). Support's first question is almost always
+    # "where did this payment come from".
+    transaction_type: str | None = None
+    # Which PROVIDER settled it — a different question, deliberately.
+    payment_provider: str | None = None
     provider_reference: str | None
     collection_transid: str | None = None
     # Never the raw payer_phone column — see _mask_phone/from_transaction.
@@ -38,6 +45,13 @@ class TransactionRead(BaseModel):
     stk_requested_at: datetime | None = None
     completed_at: datetime | None = None
     failed_at: datetime | None = None
+    # ACCESS, not money. A row can be COMPLETED with activation FAILED —
+    # the customer paid and is not online — which is the single most
+    # important state for support to be able to see.
+    activation_status: str | None = None
+    activated_at: datetime | None = None
+    package_id: UUID | None = None
+    router_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -63,8 +77,14 @@ class TransactionRead(BaseModel):
             provider_resultcode=transaction.provider_resultcode,
             provider_message=transaction.provider_message,
             stk_requested_at=transaction.stk_requested_at,
+            transaction_type=transaction.transaction_type,
+            payment_provider=transaction.payment_provider,
             completed_at=transaction.completed_at,
             failed_at=transaction.failed_at,
+            activation_status=transaction.activation_status,
+            activated_at=transaction.activated_at,
+            package_id=transaction.package_id,
+            router_id=transaction.router_id,
             created_at=transaction.created_at,
             updated_at=transaction.updated_at,
         )

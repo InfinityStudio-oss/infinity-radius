@@ -10,6 +10,19 @@ import {
 } from "@/components/captive-portal/package-selector";
 import { usePublicApiQuery } from "@/lib/hooks/use-public-api-query";
 import { apiFetch, apiMutate, ApiClientError } from "@/lib/api-client";
+import {
+  canRetryPayment,
+  formatDuration,
+  formatTzs,
+  isPlausibleTzSubscriberNumber,
+  isTerminalState,
+  pollIntervalMs,
+  sanitizeSubscriberInput,
+  screenStateFor,
+  type PaymentInitiateResult,
+  type PaymentStatusResult,
+  type ScreenState,
+} from "@/lib/captive-portal/flow";
 
 /** Mirrors apps/api/app/schemas/captive_portal.py — keep in sync by hand. */
 interface CaptivePortalResolveResult {
@@ -27,28 +40,15 @@ interface CaptivePortalBranding {
   brand_color: string | null;
 }
 
-interface PaymentInitiateResult {
-  transaction_token: string;
-  status: "pending" | "provider_not_configured";
-  amount: string;
-  currency: string;
-}
-
-interface PaymentStatusResult {
-  status: "pending" | "completed" | "failed" | "not_found";
-  login_username: string | null;
-  login_password: string | null;
-}
-
-type Step = "select-package" | "enter-phone" | "waiting" | "success" | "failed" | "unavailable";
-
-const POLL_INTERVAL_MS = 3000;
-
-/** Loose client-side check only — normalize_tz_phone on the backend is the
- * real validator. 9 digits after the fixed +255, starting 6 or 7. */
-function isPlausibleTzSubscriberNumber(digits: string): boolean {
-  return /^[67]\d{8}$/.test(digits);
-}
+/** Confirmation is a deliberate, separate step: a customer must see the
+ *  package, the price and the validity they are about to pay for before
+ *  anything reaches their handset. */
+type Step =
+  | "select-package"
+  | "enter-phone"
+  | "confirm"
+  | "waiting"
+  | "unavailable";
 
 /** True only for an absolute http(s) URL — never used otherwise, so a
  * malformed `dst` from a hotspot's own query string can't smuggle
@@ -79,11 +79,18 @@ function CaptivePortalContent() {
   const [phoneError, setPhoneError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [transactionToken, setTransactionToken] = useState<string | null>(null);
-  const [loginCredentials, setLoginCredentials] = useState<{
-    username: string;
-    password: string;
-  } | null>(null);
+  const [statusResult, setStatusResult] = useState<PaymentStatusResult | null>(null);
   const [unavailableReason, setUnavailableReason] = useState<string | null>(null);
+  /** Secondary UX guard only. The real duplicate protection is server-side
+   *  (one live attempt per session/package/phone) — a frontend lock cannot
+   *  be the security boundary. */
+  const submittedRef = useRef(false);
+
+  const screen: ScreenState | null = statusResult ? screenStateFor(statusResult) : null;
+  const loginCredentials =
+    statusResult?.login_username && statusResult?.login_password
+      ? { username: statusResult.login_username, password: statusResult.login_password }
+      : null;
 
   const resolvePath = routerToken
     ? `/api/v1/public/captive-portal/resolve?router=${encodeURIComponent(routerToken)}${
@@ -101,83 +108,118 @@ function CaptivePortalContent() {
   const siteName = resolved?.site_name ?? resolved?.router_name ?? null;
   const loginUrl = resolved?.login_url ?? null;
 
-  async function handleChoosePackage() {
+  function handleChoosePackage() {
     if (!selectedPackage) return;
     setStep("enter-phone");
   }
 
-  async function handleSubmitPhone() {
-    if (!routerToken || !selectedPackage) return;
+  function handleConfirmPhone() {
     if (!isPlausibleTzSubscriberNumber(subscriberNumber)) {
       setPhoneError("Enter a valid Tanzanian mobile number (e.g. 712 345 678).");
       return;
     }
     setPhoneError(null);
+    setStep("confirm");
+  }
+
+  /** The one deliberate "spend my money" action in the whole flow. */
+  async function handlePay() {
+    if (!routerToken || !selectedPackage) return;
+    if (submittedRef.current) return; // double-click guard (UX only)
+    submittedRef.current = true;
     setSubmitting(true);
     try {
+      // A fresh single-use session per attempt. The router token cannot
+      // authorize a payment on its own — see the backend's captive intent
+      // token.
+      const session = await apiMutate<{ intent_token: string }>(
+        "/api/v1/public/captive-portal/session",
+        { body: { router: routerToken, mac_address: mac ?? undefined } },
+      );
+
       const initiated = await apiMutate<PaymentInitiateResult>(
         "/api/v1/public/captive-portal/payments/initiate",
         {
           body: {
-            router: routerToken,
+            intent_token: session.intent_token,
             package_id: selectedPackage.id,
+            // Server normalizes authoritatively; this prefix is UX only.
             phone: `255${subscriberNumber}`,
           },
         },
       );
-      if (initiated.status === "provider_not_configured") {
+
+      if (initiated.status === "unavailable" || initiated.status === "provider_not_configured") {
         setUnavailableReason(
-          "Online payment isn't available on this network yet. Please contact your network administrator.",
+          initiated.message ??
+            "Online payment is not available on this network yet. Please contact your network administrator.",
         );
         setStep("unavailable");
         return;
       }
+      if (initiated.status === "rate_limited") {
+        setUnavailableReason(
+          initiated.message ?? "Too many payment attempts. Please wait a few minutes and try again.",
+        );
+        setStep("unavailable");
+        return;
+      }
+      // "duplicate" is a success path: the server handed back the attempt
+      // already in flight rather than sending a second prompt.
       setTransactionToken(initiated.transaction_token);
       setStep("waiting");
     } catch (err) {
+      submittedRef.current = false;
       setPhoneError(
         err instanceof ApiClientError ? err.message : "Could not start payment. Try again.",
       );
+      setStep("enter-phone");
     } finally {
       setSubmitting(false);
     }
   }
 
-  // Polls every 2-5s (here: 3s) — the initial, simplest-correct
-  // implementation the payment-waiting screen needs. Stops as soon as a
-  // terminal status (completed/failed) is reached.
+  /** Only reachable from a genuinely failed payment — see canRetryPayment. */
+  function handleDeliberateRetry() {
+    submittedRef.current = false;
+    setTransactionToken(null);
+    setStatusResult(null);
+    setStep("select-package");
+  }
+
+  // Polls with backoff: responsive at first (most STK approvals land in
+  // seconds), then slower, so a customer who walks away does not leave a
+  // tab hammering the API. Stops only once there is genuinely nothing
+  // left to learn — an under-review payment keeps being watched, because
+  // it can still settle.
   useEffect(() => {
     if (step !== "waiting" || !transactionToken) return;
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
 
     async function poll() {
+      attempt += 1;
       try {
         const result = await apiFetch<PaymentStatusResult>(
-          `/api/v1/public/captive-portal/payments/status?token=${encodeURIComponent(transactionToken as string)}`,
+          `/api/v1/public/captive-portal/payments/status?token=${encodeURIComponent(
+            transactionToken as string,
+          )}`,
         );
         if (cancelled) return;
-        if (result.status === "completed") {
-          if (result.login_username && result.login_password) {
-            setLoginCredentials({
-              username: result.login_username,
-              password: result.login_password,
-            });
-          }
-          setStep("success");
-        } else if (result.status === "failed" || result.status === "not_found") {
-          setStep("failed");
-        }
+        setStatusResult(result);
+        if (isTerminalState(screenStateFor(result))) return;
       } catch {
         // Transient network error on a low-quality pre-auth connection —
-        // just try again on the next tick, don't fail the whole flow.
+        // try again on the next tick rather than failing the whole flow.
       }
+      if (!cancelled) timer = setTimeout(poll, pollIntervalMs(attempt));
     }
 
-    const interval = setInterval(poll, POLL_INTERVAL_MS);
     void poll();
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
     };
   }, [step, transactionToken]);
 
@@ -307,8 +349,7 @@ function CaptivePortalContent() {
                   <h2 className="text-on-surface text-lg font-semibold">Your mobile number</h2>
                 </div>
                 <p className="text-on-surface-variant text-sm">
-                  We&apos;ll send a payment request to this number for{" "}
-                  <MoneyDisplay amount={selectedPackage.price_tzs} currency="TZS" />.
+                  We&apos;ll send a payment request to this number.
                 </p>
                 <div className="bg-surface-container-low focus-within:ring-primary flex items-center gap-2 rounded-lg px-3 py-3 focus-within:ring-1">
                   <span className="text-on-surface-variant font-mono text-sm font-semibold">
@@ -319,22 +360,20 @@ function CaptivePortalContent() {
                     autoComplete="tel-national"
                     maxLength={9}
                     value={subscriberNumber}
-                    onChange={(e) =>
-                      setSubscriberNumber(e.target.value.replace(/\D/g, "").slice(0, 9))
-                    }
+                    onChange={(e) => setSubscriberNumber(sanitizeSubscriberInput(e.target.value))}
                     placeholder="712 345 678"
+                    aria-label="Mobile number"
                     className="text-on-surface placeholder:text-outline w-full bg-transparent font-mono text-sm tracking-wide focus:outline-none"
                   />
                 </div>
                 {phoneError && <p className="text-error text-xs font-medium">{phoneError}</p>}
                 <button
                   type="button"
-                  disabled={submitting || subscriberNumber.length < 9}
-                  onClick={handleSubmitPhone}
+                  disabled={subscriberNumber.length < 9}
+                  onClick={handleConfirmPhone}
                   className="from-primary-container to-tertiary-container text-on-primary-container flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r px-4 py-3 font-bold shadow-lg transition-all disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {submitting && <Loader2 size={16} className="animate-spin" />}
-                  Pay &amp; Connect
+                  Review payment
                 </button>
                 <button
                   type="button"
@@ -346,20 +385,135 @@ function CaptivePortalContent() {
               </section>
             )}
 
-            {step === "waiting" && (
-              <section className="relative z-10 flex flex-col items-center gap-3 py-6 text-center">
-                <Loader2 size={36} className="text-primary animate-spin" />
-                <h2 className="text-on-surface text-lg font-semibold">
-                  Waiting for payment confirmation
-                </h2>
-                <p className="text-on-surface-variant text-sm">
-                  Check your phone and approve the payment prompt. This page will update
-                  automatically.
+            {/* Deliberate confirmation. Nothing reaches the customer's
+                handset until they have seen exactly what they are buying,
+                for how long, and at what price. */}
+            {step === "confirm" && selectedPackage && (
+              <section className="relative z-10 flex flex-col gap-3">
+                <div className="flex items-center gap-1.5">
+                  <span className="bg-primary-container text-on-primary-container flex h-5 w-5 items-center justify-center rounded-full font-mono text-[0.6875rem] font-bold">
+                    3
+                  </span>
+                  <h2 className="text-on-surface text-lg font-semibold">Confirm your purchase</h2>
+                </div>
+
+                <dl className="bg-surface-container-low flex flex-col gap-2 rounded-lg p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-on-surface-variant text-sm">Plan</dt>
+                    <dd className="text-on-surface text-sm font-semibold">
+                      {selectedPackage.name}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-on-surface-variant text-sm">Valid for</dt>
+                    <dd className="text-on-surface text-sm font-semibold">
+                      {formatDuration(selectedPackage.duration_minutes)}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-on-surface-variant text-sm">Mobile number</dt>
+                    <dd className="text-on-surface font-mono text-sm font-semibold">
+                      +255 {subscriberNumber}
+                    </dd>
+                  </div>
+                  <div className="border-outline-variant/40 mt-1 flex items-center justify-between gap-3 border-t pt-2">
+                    <dt className="text-on-surface text-base font-semibold">Total</dt>
+                    <dd className="text-on-surface text-lg font-extrabold">
+                      TZS {formatTzs(selectedPackage.price_tzs)}
+                    </dd>
+                  </div>
+                </dl>
+
+                <p className="text-on-surface-variant text-xs">
+                  You&apos;ll get a prompt on your phone. Enter your mobile money PIN to complete
+                  the payment.
                 </p>
+
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={handlePay}
+                  className="from-primary-container to-tertiary-container text-on-primary-container flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r px-4 py-3 font-bold shadow-lg transition-all disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {submitting && <Loader2 size={16} className="animate-spin" />}
+                  Pay with Mobile Money
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setStep("enter-phone")}
+                  className="text-on-surface-variant text-center text-xs font-medium"
+                >
+                  Change number
+                </button>
               </section>
             )}
 
-            {step === "success" && (
+            {step === "waiting" && screen !== "active" && screen !== "failed" && (
+              <section className="relative z-10 flex flex-col items-center gap-3 py-6 text-center">
+                {screen === "under-review" ? (
+                  <>
+                    {/* The most important screen in the flow. This payment
+                        may still settle, so the customer must NOT be told
+                        it failed and must NOT be offered a retry — paying
+                        again on top of one that later succeeds is a real
+                        double charge. */}
+                    <ShieldCheck size={40} className="text-tertiary" />
+                    <h2 className="text-on-surface text-lg font-semibold">
+                      Still confirming your payment
+                    </h2>
+                    <p className="text-on-surface-variant text-sm">
+                      {statusResult?.message ??
+                        "We are still confirming your payment with your mobile money provider."}
+                    </p>
+                    <p className="bg-error-container/30 text-on-surface rounded-lg px-3 py-2 text-sm font-semibold">
+                      Please do NOT pay again. If money left your account it will be applied to
+                      this purchase.
+                    </p>
+                  </>
+                ) : screen === "activating" ? (
+                  <>
+                    <Loader2 size={36} className="text-secondary animate-spin" />
+                    <h2 className="text-on-surface text-lg font-semibold">Payment confirmed</h2>
+                    <p className="text-on-surface-variant text-sm">
+                      Setting up your internet access — this only takes a moment.
+                    </p>
+                  </>
+                ) : screen === "activation-failed" ? (
+                  <>
+                    <ShieldCheck size={40} className="text-tertiary" />
+                    <h2 className="text-on-surface text-lg font-semibold">Payment received</h2>
+                    <p className="text-on-surface-variant text-sm">
+                      {statusResult?.message ??
+                        "We could not finish setting up your access automatically."}
+                    </p>
+                    <p className="text-on-surface-variant text-xs">
+                      Our team has been notified. You have <strong>not</strong> been charged twice
+                      — please contact your network administrator if access does not start
+                      shortly.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <Loader2 size={36} className="text-primary animate-spin" />
+                    <h2 className="text-on-surface text-lg font-semibold">
+                      Waiting for payment confirmation
+                    </h2>
+                    <p className="text-on-surface-variant text-sm">
+                      Check your phone and approve the payment prompt. This page will update
+                      automatically.
+                    </p>
+                  </>
+                )}
+                {statusResult?.package_name && (
+                  <p className="text-on-surface-variant font-mono text-[0.6875rem]">
+                    {statusResult.package_name} · TZS {formatTzs(statusResult.amount)}
+                    {statusResult.payer_phone_masked ? ` · ${statusResult.payer_phone_masked}` : ""}
+                  </p>
+                )}
+              </section>
+            )}
+
+            {step === "waiting" && screen === "active" && (
               <section className="relative z-10 flex flex-col items-center gap-3 py-6 text-center">
                 <CheckCircle2 size={40} className="text-secondary" />
                 <h2 className="text-on-surface text-lg font-semibold">You&apos;re connected!</h2>
@@ -368,6 +522,11 @@ function CaptivePortalContent() {
                     ? "Finishing your connection…"
                     : "Payment confirmed. Reconnect to the WiFi to go online."}
                 </p>
+                {statusResult?.provider_reference && (
+                  <p className="text-on-surface-variant font-mono text-[0.6875rem]">
+                    Receipt: {statusResult.provider_reference}
+                  </p>
+                )}
                 {loginUrl && loginCredentials && (
                   <LoginRedirectForm
                     loginUrl={loginUrl}
@@ -379,24 +538,25 @@ function CaptivePortalContent() {
               </section>
             )}
 
-            {step === "failed" && (
+            {step === "waiting" && screen === "failed" && (
               <section className="relative z-10 flex flex-col items-center gap-3 py-6 text-center">
                 <XCircle size={40} className="text-error" />
                 <h2 className="text-on-surface text-lg font-semibold">Payment not completed</h2>
                 <p className="text-on-surface-variant text-sm">
-                  The payment wasn&apos;t confirmed. You haven&apos;t been charged for a plan you
-                  didn&apos;t get.
+                  {statusResult?.message ??
+                    "The payment wasn't confirmed. You haven't been charged for a plan you didn't get."}
                 </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setStep("select-package");
-                    setTransactionToken(null);
-                  }}
-                  className="bg-surface-container-high text-on-surface rounded-lg px-4 py-2.5 text-sm font-semibold"
-                >
-                  Try again
-                </button>
+                {/* A new attempt is deliberate and creates a NEW order — it
+                    never resends the previous provider request. */}
+                {screen && canRetryPayment(screen) && (
+                  <button
+                    type="button"
+                    onClick={handleDeliberateRetry}
+                    className="bg-surface-container-high text-on-surface rounded-lg px-4 py-2.5 text-sm font-semibold"
+                  >
+                    Try again
+                  </button>
+                )}
               </section>
             )}
 
