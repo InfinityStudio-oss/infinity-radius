@@ -46,7 +46,12 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.enums import COLLECTION_TERMINAL_STATUSES, CollectionStatus, TransactionType
+from app.core.enums import (
+    COLLECTION_TERMINAL_STATUSES,
+    CollectionStatus,
+    PaymentProvider,
+    TransactionType,
+)
 from app.core.errors import NotFoundError
 from app.integrations.selcom_collection.client import SelcomCollectionClient
 from app.integrations.selcom_collection.config import selcom_collection_config_from_settings
@@ -109,11 +114,18 @@ class SelcomPaymentFlow:
     it. A captive-portal payment stays CAPTIVE_PORTAL even though Selcom
     Collection is the provider.
 
+    `payment_provider` is the OTHER half of that pair: which provider
+    actually settles the money. Reconciliation discovers work by this,
+    never by transaction_type, so a Selcom-settled captive-portal payment
+    is swept exactly like a tenant Collection while a future voucher/cash
+    flow is never sent to Selcom's order-status at all.
+
     `audit_namespace`/`log_namespace` keep each flow's audit actions and
     structured log events distinguishable after the fact.
     """
 
     transaction_type: TransactionType
+    payment_provider: PaymentProvider
     reference_prefix: str
     audit_namespace: str
     log_namespace: str
@@ -497,26 +509,35 @@ class SelcomPaymentProvider:
         return transaction
 
     async def list_reconcilable(self) -> list[Transaction]:
-        """Every non-terminal order a periodic sweep should query — pure
-        DB read, no Selcom awareness, safe for the worker (see
-        app/tasks/collections.py).
+        """Every non-terminal payment THIS PROVIDER owns that a periodic
+        sweep should query — pure DB read, no Selcom awareness, safe for
+        the worker (see app/tasks/collections.py).
 
-        Deliberately NOT filtered by transaction_type, exactly as before
-        this module was extracted: reconciliation must cover every
-        reconcilable Selcom payment regardless of which business flow
-        created it, which is the opposite of the tenant dashboard's
-        type-scoped list. Captive-portal rows do not appear here today
-        because they never reach a CollectionStatus value. When a second
-        flow does go live, this needs a provider discriminator (a
-        `payment_provider` column) rather than a type filter — see
-        docs/architecture.md.
+        Scoped by `payment_provider`, deliberately NOT by
+        transaction_type. Those answer different questions, and
+        reconciliation needs the provider one: a captive-portal package
+        payment settled through Selcom must be swept exactly like a tenant
+        Collection, while a future voucher/cash captive payment must never
+        be sent to Selcom's order-status at all. This is the exact
+        opposite of the tenant dashboard's type-scoped list, which stays
+        on transaction_type=COLLECTION and must never widen.
+
+        Rows with a NULL provider are excluded rather than assumed. That
+        is safe because every writer that can produce a non-terminal
+        Selcom row sets payment_provider explicitly, and the c4f81b2e9a37
+        backfill classified every historical COLLECTION row — an
+        ordering the Phase 3 rollout depended on. A NULL-provider row is
+        visible for review, never silently queried against a provider it
+        may never have reached.
         """
         non_terminal = [
             status.value
             for status in CollectionStatus
             if status not in COLLECTION_TERMINAL_STATUSES
         ]
-        return await self.repo.list_by_statuses(statuses=non_terminal)
+        return await self.repo.list_reconcilable_by_provider(
+            payment_provider=self._flow.payment_provider.value, statuses=non_terminal
+        )
 
     # ----------------------------------------------------------- webhook
 

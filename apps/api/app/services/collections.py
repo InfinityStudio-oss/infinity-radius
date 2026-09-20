@@ -22,7 +22,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.enums import CollectionStatus, TransactionType
+from app.core.enums import CollectionStatus, PaymentProvider, TransactionType
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.phone import normalize_tz_phone
 from app.integrations.selcom_collection.schemas import OrderStatusData
@@ -39,6 +39,7 @@ from app.services.wallet import WalletService
 # stay continuous.
 COLLECTION_FLOW = SelcomPaymentFlow(
     transaction_type=TransactionType.COLLECTION,
+    payment_provider=PaymentProvider.SELCOM_COLLECTION,
     reference_prefix="col-",
     audit_namespace="collection",
     log_namespace="collections",
@@ -134,6 +135,12 @@ class CollectionService:
             tenant_id=tenant_id,
             customer_id=customer_id,
             transaction_type=COLLECTION_FLOW.transaction_type.value,
+            # MUST be set here: reconciliation discovers work by
+            # payment_provider (SelcomPaymentProvider.list_reconcilable), so
+            # a row created without it would never be swept and a real
+            # payment could sit unresolved forever. Both halves come from the
+            # flow, so they can never drift apart.
+            payment_provider=COLLECTION_FLOW.payment_provider.value,
             reference=reference,
             amount=str(amount),
             currency=currency,

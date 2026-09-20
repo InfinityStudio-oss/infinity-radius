@@ -23,7 +23,13 @@ from app.repositories.base import BaseRepository
 class TransactionRepository(BaseRepository[Transaction]):
     model = Transaction
     search_fields = ("reference", "channel")
-    filterable_fields = ("status", "channel", "customer_id", "transaction_type")
+    filterable_fields = (
+        "status",
+        "channel",
+        "customer_id",
+        "transaction_type",
+        "payment_provider",
+    )
     sortable_fields = ("created_at", "amount", "status")
 
     async def get_by_reference(self, *, reference: str) -> Transaction | None:
@@ -47,6 +53,31 @@ class TransactionRepository(BaseRepository[Transaction]):
 
     async def list_by_statuses(self, *, statuses: list[str]) -> list[Transaction]:
         stmt = select(Transaction).where(Transaction.status.in_(statuses))
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_reconcilable_by_provider(
+        self, *, payment_provider: str, statuses: list[str]
+    ) -> list[Transaction]:
+        """Platform-wide (tenant-agnostic) discovery for the periodic
+        reconciliation sweep: every row THIS PROVIDER settles that is
+        still in a non-terminal status.
+
+        Scoped by `payment_provider`, never `transaction_type` — the two
+        answer different questions and reconciliation needs the provider
+        one, so a Selcom-settled captive-portal payment is swept exactly
+        like a tenant Collection. This is deliberately the OPPOSITE of
+        list_by_type_paginated, which scopes the tenant dashboard by type
+        and must never widen to include captive-portal rows.
+
+        `payment_provider` is matched exactly, so a NULL-provider row is
+        excluded rather than assumed — see the c4f81b2e9a37 migration and
+        SelcomPaymentProvider.list_reconcilable.
+        """
+        stmt = select(Transaction).where(
+            Transaction.payment_provider == payment_provider,
+            Transaction.status.in_(statuses),
+        )
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 

@@ -29,7 +29,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import PackageStatus, TransactionType
+from app.core.enums import PackageStatus, PaymentProvider, TransactionType
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.money import DEFAULT_CURRENCY
 from app.core.transaction_token import create_transaction_token, resolve_transaction_token
@@ -50,8 +50,33 @@ from app.services.radius_sync import (
     provision_customer_radius_access,
     sync_package_radius_group,
 )
+from app.services.selcom_payment_provider import SelcomPaymentFlow
 from app.services.subscriptions import SubscriptionService
 from app.services.wallet import WalletService
+
+# The identity the captive-portal flow WILL use once it is wired to the
+# validated provider. Declared here now so the writer and the reconciliation
+# sweep are defined together and cannot drift: the moment initiate_payment
+# calls SelcomPaymentProvider, it passes this, and every row it creates is
+# discovered by the provider-scoped sweep automatically.
+#
+# transaction_type stays CAPTIVE_PORTAL — the business flow — while
+# payment_provider is SELCOM_COLLECTION. That pairing is the whole point of
+# having two columns: these rows must be reconciled exactly like a tenant
+# Collection, yet must NEVER appear in the tenant Collections dashboard.
+#
+# NOT WIRED UP. initiate_payment below deliberately does NOT set
+# payment_provider today, because it contacts no provider at all — see its
+# body. Writing SELCOM_COLLECTION on a row that never reached Selcom would
+# fabricate history AND make the sweep query order-status for an order_id
+# that was never created.
+CAPTIVE_PORTAL_SELCOM_FLOW = SelcomPaymentFlow(
+    transaction_type=TransactionType.CAPTIVE_PORTAL,
+    payment_provider=PaymentProvider.SELCOM_COLLECTION,
+    reference_prefix="CP-",
+    audit_namespace="captive_portal",
+    log_namespace="captive_portal",
+)
 
 
 class CaptivePortalService:
@@ -124,6 +149,13 @@ class CaptivePortalService:
         # STK is ever requested and no provider is ever contacted — see
         # this module's docstring. Stated as one honest constant rather
         # than inferred from a call that could only ever fail.
+        #
+        # This is also why the row above deliberately carries NO
+        # payment_provider: it has not reached one. Reconciliation
+        # discovers work by payment_provider, so leaving it NULL is what
+        # keeps the sweep from querying Selcom's order-status for an
+        # order that was never created. CAPTIVE_PORTAL_SELCOM_FLOW above
+        # is what sets it, once initiation genuinely goes to Selcom.
         provider_configured = False
 
         await write_audit_log(
