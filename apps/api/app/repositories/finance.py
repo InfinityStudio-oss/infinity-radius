@@ -81,6 +81,39 @@ class TransactionRepository(BaseRepository[Transaction]):
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
+    async def find_active_captive_attempt(
+        self,
+        *,
+        captive_session_id: UUID,
+        package_id: UUID,
+        payer_phone: str,
+        non_terminal_statuses: list[str],
+    ) -> Transaction | None:
+        """The duplicate-attempt guard for captive payments.
+
+        A double-click, a refresh, a second tab or an HTTP retry must all
+        land on the SAME payment attempt rather than creating another
+        transaction and another STK push to the customer's handset.
+
+        Matched on the full context that identifies one attempt — session,
+        package and the normalized msisdn — restricted to attempts that
+        have not reached a terminal state. Once an attempt genuinely ends
+        without success (CANCELLED/DECLINED/...), it stops matching, so a
+        customer CAN deliberately try again; they just cannot do it by
+        accident while one is still live.
+
+        Phone must already be normalized, or 0712345678 and
+        +255712345678 would look like two different attempts.
+        """
+        stmt = select(Transaction).where(
+            Transaction.captive_session_id == captive_session_id,
+            Transaction.package_id == package_id,
+            Transaction.payer_phone == payer_phone,
+            Transaction.status.in_(non_terminal_statuses),
+        )
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
+
     async def count_by_status(
         self, *, tenant_id: UUID, transaction_type: str
     ) -> dict[str, int]:

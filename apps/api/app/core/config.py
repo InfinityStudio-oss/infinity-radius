@@ -104,6 +104,44 @@ class Settings(BaseSettings):
     secrets_encryption_key: str
     router_token_signing_key: str
     transaction_token_signing_key: str
+    # A THIRD, separate Fernet key for the short-lived captive payment
+    # intent token (see app/core/captive_intent_token.py). Deliberately NOT
+    # router_token_signing_key: that one is permanent, lives inside every
+    # router's own hotspot config, and is shared by every customer at a
+    # site — reusing it as a payment credential would make an intercepted
+    # site identifier enough to authorize payments indefinitely.
+    #
+    # Optional so the app never fails to boot without it (the same lazy
+    # principle as the Selcom credentials). The captive session endpoint
+    # fails closed with a clear error instead.
+    captive_intent_token_signing_key: str | None = None
+    # How long a captive payment intent stays valid. Long enough for a
+    # customer to read package options and find their phone, short enough
+    # that a captured token is not a standing authorization.
+    captive_intent_token_ttl_seconds: int = 900  # 15 minutes
+
+    # --- Captive-portal abuse controls (see app/services/captive_session.py
+    # and app/middleware/rate_limit.py). Dimensions beyond client IP, because
+    # every customer behind one hotspot shares a single public IP — an
+    # IP-only limit would let one site's traffic throttle its own users
+    # while barely constraining an attacker on mobile data.
+    captive_rate_limit_per_session: int = 5
+    captive_rate_limit_per_phone: int = 5
+    captive_rate_limit_per_router: int = 60
+    captive_rate_limit_window_seconds: int = 600
+
+    # --- Captive activation retry sweep (app/tasks/captive_activation.py)
+    # Defaults OFF. Until a RADIUS provisioning transport is actually
+    # available (Network Agent in production, or RADIUS_DATABASE_URL
+    # locally), every retry would fail and the only thing the sweep
+    # would produce is a steady stream of failure noise that buries
+    # real alerts. Turn it on in the same change that provisions the
+    # transport.
+    captive_activation_retry_enabled: bool = False
+    # 600s: activation failures are an outage-shaped problem, not a
+    # race. Retrying every 10 minutes recovers access well inside a
+    # support SLA without hammering the VPS while it is already unwell.
+    captive_activation_retry_interval_seconds: int = 600
 
     # --- Walled garden (see app/services/router_provisioning.py) ---
     # The tenant-agnostic platform domains a hotspot's walled garden must

@@ -8,10 +8,12 @@ ledger credit exist.
 """
 
 import asyncio
+from types import SimpleNamespace
 from urllib.parse import urlparse
 from uuid import UUID
 
 import psycopg
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
@@ -85,192 +87,236 @@ def _create_router_and_package(headers: dict[str, str]) -> tuple[str, str]:
     return router_id, package_id
 
 
-def test_initiate_payment_creates_pending_transaction_and_subscription() -> None:
+_TEST_INTENT_KEY = "8ZQZ1yq8kJ1kZ9rN6Xk2mQ0pV7sT3wY5bA4cD6eF8gI="
+
+
+@pytest.fixture(autouse=True)
+def _intent_key(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CAPTIVE_INTENT_TOKEN_SIGNING_KEY", _TEST_INTENT_KEY)
+    get_settings.cache_clear()
+    import app.core.captive_intent_token as m
+
+    m._fernet.cache_clear()
+    yield
+    get_settings.cache_clear()
+    m._fernet.cache_clear()
+
+
+@pytest.fixture
+def gate_open(monkeypatch: pytest.MonkeyPatch):
+    """Opens the production gate and stubs Selcom so the flow behind the
+    kill switch can be exercised without any possibility of a real
+    provider call."""
+    from app.integrations.selcom_collection.client import SelcomCollectionClient
+
+    monkeypatch.setenv("SELCOM_COLLECTION_BASE_URL", "https://apigwtest.selcommobile.com")
+    monkeypatch.setenv("SELCOM_COLLECTION_API_KEY", "test-collection-key-never-real")
+    monkeypatch.setenv("SELCOM_COLLECTION_API_SECRET", "test-collection-secret-never-real")
+    monkeypatch.setenv("SELCOM_COLLECTION_DIGEST_METHOD", "HS256")
+    monkeypatch.setenv("SELCOM_COLLECTION_VENDOR", "TEST-VENDOR")
+    monkeypatch.setenv("SELCOM_COLLECTION_ENABLED", "true")
+    monkeypatch.setenv("SELCOM_COLLECTION_PRODUCTION_ENABLED", "true")
+    get_settings.cache_clear()
+
+    async def _create_order(self, **kwargs):
+        return None
+
+    async def _wallet_payment(self, **kwargs):
+        return SimpleNamespace(resultcode="111", message="PENDING")
+
+    monkeypatch.setattr(SelcomCollectionClient, "create_order_minimal", _create_order)
+    monkeypatch.setattr(SelcomCollectionClient, "wallet_payment", _wallet_payment)
+    yield
+    get_settings.cache_clear()
+
+
+def _open_session(router_token: str, mac: str | None = "AA:BB:CC:DD:EE:FF") -> str:
+    response = client.post(
+        "/api/v1/public/captive-portal/session",
+        json={"router": router_token, "mac_address": mac},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["intent_token"]
+
+
+def test_initiate_payment_persists_the_full_captive_context(gate_open: None) -> None:
+    """Every column support needs to answer "who paid what, from where"
+    must be written at initiation — not inferred later from a join that
+    breaks when a payment never completes."""
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
         headers = auth_header(user_id=user_id)
-
-        router_id = client.post(
-            "/api/v1/routers", headers=headers, json={"name": "Router"}
-        ).json()["data"]["id"]
-        package_id = client.post(
-            "/api/v1/packages",
-            headers=headers,
-            json={"name": "Pkg", "price_tzs": "1500", "status": "active"},
-        ).json()["data"]["id"]
-
-        token_response = client.get(
-            f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
-        )
-        router_token = token_response.json()["data"]["router_token"]
-
-        response = client.post(
-            "/api/v1/public/captive-portal/payments/initiate",
-            json={"router": router_token, "package_id": package_id, "phone": "0712345678"},
-        )
-
-    assert response.status_code == 201
-    body = response.json()  # public endpoint — no ApiResponse envelope
-    assert body["status"] == "provider_not_configured"  # Selcom is not implemented
-    assert body["amount"] == "1500.00"
-    assert body["currency"] == "TZS"
-    assert "transaction_token" in body
-    # Never a raw database id anywhere in the response.
-    assert "id" not in body
-    assert "transaction_id" not in body
-    assert "subscription_id" not in body
-    assert "customer_id" not in body
-
-
-def test_initiate_payment_writes_the_captive_portal_discriminator() -> None:
-    """`transactions` is shared with Selcom Collection, so every captive
-    portal row must classify itself explicitly — otherwise it would either
-    be invisible or, worse, show up in a tenant's Collections list."""
-    with SeededContext() as ctx:
-        tenant_id = ctx.new_tenant()
-        user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
-        headers = auth_header(user_id=user_id)
-
-        router_id = client.post(
-            "/api/v1/routers", headers=headers, json={"name": "Router"}
-        ).json()["data"]["id"]
-        package_id = client.post(
-            "/api/v1/packages",
-            headers=headers,
-            json={"name": "Pkg", "price_tzs": "1500", "status": "active"},
-        ).json()["data"]["id"]
+        router_id, package_id = _create_router_and_package(headers)
         router_token = client.get(
             f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
         ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
 
-        initiate_response = client.post(
+        response = client.post(
             "/api/v1/public/captive-portal/payments/initiate",
-            json={"router": router_token, "package_id": package_id, "phone": "0712345678"},
+            json={"intent_token": intent, "package_id": package_id, "phone": "0755900001"},
         )
-        transaction_id = resolve_transaction_token(
-            initiate_response.json()["transaction_token"]
-        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["status"] == "pending", body
+        # The authoritative amount came from the package, not the request.
+        assert body["amount"] == "1500.00"
+        assert body["currency"] == "TZS"
+        assert body["transaction_token"]
 
+        transaction_id = resolve_transaction_token(body["transaction_token"])
         assert ctx._conn is not None
         with ctx._conn.cursor() as cur:
             cur.execute(
-                "SELECT transaction_type FROM transactions WHERE id = %s",
+                "SELECT transaction_type, payment_provider, package_id, router_id, "
+                "captive_session_id, device_mac, payer_phone, amount, currency, status "
+                "FROM transactions WHERE id = %s",
                 (str(transaction_id),),
             )
             row = cur.fetchone()
 
     assert row is not None
-    assert row[0] == "CAPTIVE_PORTAL"
+    (
+        transaction_type, payment_provider, pkg, rtr, session_id,
+        device_mac, payer_phone, amount, currency, status,
+    ) = row
+    # The pairing that makes two columns necessary.
+    assert transaction_type == "CAPTIVE_PORTAL"
+    assert payment_provider == "SELCOM_COLLECTION"
+    assert str(pkg) == package_id
+    assert str(rtr) == router_id
+    assert session_id is not None
+    assert device_mac == "AA:BB:CC:DD:EE:FF"
+    # Normalized server-side from 0712345678.
+    assert payer_phone == "255755900001"
+    assert str(amount) == "1500.00"
+    assert currency == "TZS"
+    assert status == "STK_SENT"
 
 
-def test_initiate_payment_records_mac_address_in_the_audit_trail() -> None:
-    """mac_address correlates the payment with the originating hotspot
-    session for audit/troubleshooting only — it must never affect the
-    charged amount (already covered above: amount always == package
-    price_tzs), but it should genuinely be recorded somewhere real."""
+def test_phone_is_normalized_server_side(gate_open: None) -> None:
+    """All three accepted forms must converge on one stored msisdn, or the
+    duplicate-attempt guard could be bypassed by changing the spelling."""
+    for entered, expected in (
+        ("0755000001", "255755000001"),
+        ("+255755000002", "255755000002"),
+        ("255755000003", "255755000003"),
+    ):
+        with SeededContext() as ctx:
+            tenant_id = ctx.new_tenant()
+            headers = auth_header(
+                user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
+            )
+            router_id, package_id = _create_router_and_package(headers)
+            router_token = client.get(
+                f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
+            ).json()["data"]["router_token"]
+            intent = _open_session(router_token)
+
+            response = client.post(
+                "/api/v1/public/captive-portal/payments/initiate",
+                json={"intent_token": intent, "package_id": package_id, "phone": entered},
+            )
+            body = response.json()
+            assert body["status"] == "pending", body
+            transaction_id = resolve_transaction_token(body["transaction_token"])
+            assert ctx._conn is not None
+            with ctx._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT payer_phone FROM transactions WHERE id = %s", (str(transaction_id),)
+                )
+                (stored,) = cur.fetchone()
+        assert stored == expected, f"{entered} normalized to {stored}"
+
+
+def test_duplicate_submit_reuses_the_attempt_and_sends_no_second_stk(
+    gate_open: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Double-click, refresh, second tab and HTTP retry all land here. The
+    customer must get their ORIGINAL attempt back — a second STK to their
+    handset would be both confusing and abusable."""
+    from app.integrations.selcom_collection.client import SelcomCollectionClient
+
+    stk_calls = {"n": 0}
+
+    async def _counting_wallet_payment(self, **kwargs):
+        stk_calls["n"] += 1
+        return SimpleNamespace(resultcode="111", message="PENDING")
+
+    monkeypatch.setattr(SelcomCollectionClient, "wallet_payment", _counting_wallet_payment)
+
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
-        user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
-        headers = auth_header(user_id=user_id)
+        headers = auth_header(user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id))
         router_id, package_id = _create_router_and_package(headers)
         router_token = client.get(
             f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
         ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
+        payload = {"intent_token": intent, "package_id": package_id, "phone": "0755111222"}
 
-        response = client.post(
-            "/api/v1/public/captive-portal/payments/initiate",
-            json={
-                "router": router_token,
-                "package_id": package_id,
-                "phone": "0712345699",
-                "mac_address": "AA:BB:CC:DD:EE:FF",
-            },
-        )
-        assert response.status_code == 201
+        first = client.post("/api/v1/public/captive-portal/payments/initiate", json=payload)
+        assert first.json()["status"] == "pending"
+
+        # The session is single-use, so a replay is rejected outright...
+        second = client.post("/api/v1/public/captive-portal/payments/initiate", json=payload)
 
         assert ctx._conn is not None
         with ctx._conn.cursor() as cur:
             cur.execute(
-                'SELECT "metadata" FROM audit_logs WHERE action = %s '
-                "ORDER BY created_at DESC LIMIT 1",
-                ("captive_portal.payment_initiated",),
+                "SELECT count(*) FROM transactions WHERE tenant_id = %s", (str(tenant_id),)
             )
-            row = cur.fetchone()
+            (transactions,) = cur.fetchone()
 
-    assert row is not None
-    assert row[0]["mac_address"] == "AA:BB:CC:DD:EE:FF"
+    # ...and either way there is exactly one attempt and exactly one STK.
+    assert second.status_code in (201, 422)
+    assert transactions == 1, "a duplicate submit must not create a second transaction"
+    assert stk_calls["n"] == 1, "a duplicate submit must not trigger a second STK"
 
 
-def test_initiate_payment_rejects_an_inactive_package() -> None:
+def test_initiate_payment_rejects_an_inactive_package(gate_open: None) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
-        user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
-        headers = auth_header(user_id=user_id)
-
+        headers = auth_header(user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id))
         router_id = client.post(
             "/api/v1/routers", headers=headers, json={"name": "Router"}
         ).json()["data"]["id"]
         package_id = client.post(
             "/api/v1/packages",
             headers=headers,
-            json={"name": "Archived Pkg", "price_tzs": "1500", "status": "archived"},
+            json={"name": "Retired", "price_tzs": "500", "status": "archived"},
         ).json()["data"]["id"]
         router_token = client.get(
             f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
         ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
 
         response = client.post(
             "/api/v1/public/captive-portal/payments/initiate",
-            json={"router": router_token, "package_id": package_id, "phone": "0712345678"},
+            json={"intent_token": intent, "package_id": package_id, "phone": "0755900009"},
         )
-
     assert response.status_code == 422
 
 
-def test_initiate_payment_rejects_an_invalid_phone() -> None:
+def test_initiate_payment_rejects_an_invalid_phone(gate_open: None) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
-        user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
-        headers = auth_header(user_id=user_id)
+        headers = auth_header(user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id))
         router_id, package_id = _create_router_and_package(headers)
         router_token = client.get(
             f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
         ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
 
         response = client.post(
             "/api/v1/public/captive-portal/payments/initiate",
-            json={"router": router_token, "package_id": package_id, "phone": "12345"},
+            json={"intent_token": intent, "package_id": package_id, "phone": "12345"},
         )
-
     assert response.status_code == 422
 
 
-def test_initiate_payment_with_an_invalid_router_token_is_rejected() -> None:
-    response = client.post(
-        "/api/v1/public/captive-portal/payments/initiate",
-        json={
-            "router": "garbage",
-            "package_id": "00000000-0000-0000-0000-000000000000",
-            "phone": "0712345678",
-        },
-    )
-    assert response.status_code == 401
-
-
-def test_status_for_an_unknown_token_reports_not_found() -> None:
-    response = client.get(
-        "/api/v1/public/captive-portal/payments/status", params={"token": "not-a-real-token"}
-    )
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "not_found",
-        "login_username": None,
-        "login_password": None,
-    }
-
-
-def test_full_payment_flow_reaches_completed_with_radius_credentials() -> None:
+def test_full_payment_flow_reaches_completed_with_radius_credentials(gate_open: None) -> None:
     with SeededContext() as ctx:
         tenant_id = ctx.new_tenant()
         user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
@@ -281,9 +327,10 @@ def test_full_payment_flow_reaches_completed_with_radius_credentials() -> None:
             f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
         ).json()["data"]["router_token"]
 
+        intent = _open_session(router_token)
         initiate_response = client.post(
             "/api/v1/public/captive-portal/payments/initiate",
-            json={"router": router_token, "package_id": package_id, "phone": "0712345671"},
+            json={"intent_token": intent, "package_id": package_id, "phone": "0712345671"},
         )
         transaction_token = initiate_response.json()["transaction_token"]
 

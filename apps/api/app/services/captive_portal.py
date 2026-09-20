@@ -22,7 +22,6 @@ and the audit trail all genuinely happen) but currently reachable only
 from tests, since nothing yet initiates a real captive-portal payment.
 """
 
-import secrets
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -30,6 +29,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.enums import (
     COLLECTION_TERMINAL_STATUSES,
     ActivationStatus,
@@ -40,8 +40,11 @@ from app.core.enums import (
 )
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.money import DEFAULT_CURRENCY
+from app.core.phone import normalize_tz_phone
 from app.core.transaction_token import create_transaction_token, resolve_transaction_token
-from app.models.network import Customer
+from app.integrations.selcom_collection.schemas import OrderStatusData
+from app.models.finance import Transaction
+from app.models.network import Customer, Package
 from app.repositories.billing import PackageRepository
 from app.repositories.finance import TransactionRepository
 from app.repositories.network import RouterRepository
@@ -52,11 +55,17 @@ from app.schemas.captive_portal import (
     CaptivePortalPaymentStatusResult,
 )
 from app.services.audit import write_audit_log
+from app.services.captive_rate_limit import CaptiveRateLimiter
+from app.services.captive_session import (
+    CaptivePortalSessionService,
+    CaptiveSessionError,
+    validate_package_ownership,
+)
 from app.services.customers import CustomerService
 from app.services.radius_sync import (
     derive_radius_password,
 )
-from app.services.selcom_payment_provider import SelcomPaymentFlow
+from app.services.selcom_payment_provider import SelcomPaymentFlow, SelcomPaymentProvider
 from app.services.subscriptions import SubscriptionService
 from app.services.wallet import WalletService
 
@@ -83,11 +92,60 @@ from app.services.wallet import WalletService
 # REQUIRES_REVIEW and AMBIGUOUS are deliberately NOT here: they are still
 # being reconciled, and telling someone their payment failed while it may
 # yet settle is how you get charged-but-told-it-failed complaints.
+# One customer-facing sentence for every reason online payment is closed —
+# an expired gate, a disabled integration, a missing credential. Operators
+# get the real reason from logs and audit; the customer gets something
+# actionable and identical in every case, so the endpoint cannot be probed
+# to learn which control is in force.
+UNAVAILABLE_MESSAGE = (
+    "Online payment is not available on this network yet. "
+    "Please contact your network administrator."
+)
+
+
+def mask_msisdn(phone: str) -> str:
+    """2557*****101 — the only form of a payer number that may appear in an
+    audit row, a log line or an API response."""
+    if len(phone) < 7:
+        return "*" * len(phone)
+    return f"{phone[:4]}{'*' * (len(phone) - 7)}{phone[-3:]}"
+
+
 _PUBLIC_FAILED_STATUSES = frozenset(
     status.value
     for status in COLLECTION_TERMINAL_STATUSES
     if status is not CollectionStatus.COMPLETED
 )
+
+# Still genuinely being verified by the provider. Projected as "pending"
+# with under_review=True so the portal can tell the customer NOT to pay
+# again — REQUIRES_REVIEW/AMBIGUOUS may still settle, and a second payment
+# on top of one that later succeeds is a real double charge.
+_UNDER_REVIEW_STATUSES = frozenset(
+    {CollectionStatus.REQUIRES_REVIEW.value, CollectionStatus.AMBIGUOUS.value}
+)
+
+# Internal ActivationStatus -> the coarse word the customer sees.
+_PUBLIC_ACTIVATION = {
+    ActivationStatus.PENDING.value: "pending",
+    ActivationStatus.ACTIVATING.value: "activating",
+    ActivationStatus.ACTIVE.value: "active",
+    ActivationStatus.FAILED.value: "failed",
+    # An operator flag, not a customer-facing distinction — a customer in
+    # this state is simply still waiting for access, not told to act.
+    ActivationStatus.REQUIRES_REVIEW.value: "failed",
+}
+
+# An attempt still in flight. A duplicate POST matching one of these
+# reuses it; once an attempt reaches ANY terminal status it stops
+# matching, so a customer can deliberately try again after a genuine
+# failure — they just cannot start a second one by accident while the
+# first is still live.
+_NON_TERMINAL_STATUSES = [
+    status.value
+    for status in CollectionStatus
+    if status not in COLLECTION_TERMINAL_STATUSES
+]
 
 
 CAPTIVE_PORTAL_SELCOM_FLOW = SelcomPaymentFlow(
@@ -125,130 +183,357 @@ class CaptivePortalService:
     async def initiate_payment(
         self,
         *,
-        tenant_id: UUID,
+        intent_token: str,
         package_id: UUID,
         phone: str,
-        mac_address: str | None = None,
     ) -> CaptivePortalPaymentInitiateResult:
-        """Frontend sends only phone_number/package_id/router_token/
-        mac_address — never an authoritative amount. The amount charged is
-        always `package.price_tzs`, looked up server-side from the
-        already-tenant-resolved package row; a client cannot influence it."""
-        package = await self.package_repo.get_by_id(tenant_id=tenant_id, id=package_id)
+        """Starts ONE captive-portal payment against the validated Selcom
+        provider.
+
+        ORDER MATTERS and is load-bearing. The production kill switch is
+        checked FIRST — before the session is consumed, before a customer,
+        subscription or transaction row exists, and long before any
+        provider contact. A closed gate must leave behind no orphan
+        subscription and no payment attempt to reconcile.
+
+        The browser supplies an intent token, a package and a phone
+        number. Everything financial — tenant, router, price, currency,
+        commercial terms — is resolved server-side from the session's own
+        router row. `amount` is not a field on the request model at all,
+        so a tampered request cannot under-pay for a package.
+        """
+        settings = get_settings()
+
+        # --- GATE FIRST: no persistence, no provider contact ------------
+        if (
+            not settings.selcom_collection_enabled
+            or not settings.selcom_collection_production_enabled
+        ):
+            # Two independent kill switches, the same pair the tenant
+            # Collection flow respects — captive payments must never be a
+            # way around them. Returning here means no session consumed,
+            # no customer, no subscription, no transaction, no provider
+            # call: nothing to reconcile or clean up later.
+            return CaptivePortalPaymentInitiateResult(
+                status="unavailable",
+                message=UNAVAILABLE_MESSAGE,
+            )
+
+        session_service = CaptivePortalSessionService(self.db)
+        try:
+            session = await session_service.resolve(intent_token=intent_token)
+        except CaptiveSessionError as exc:
+            raise DomainValidationError(
+                "This payment session has expired. Please start again."
+            ) from exc
+
+        # Looked up scoped to the SESSION's tenant, so a package id
+        # belonging to another tenant simply does not resolve.
+        package = await self.package_repo.get_by_id(
+            tenant_id=session.tenant_id, id=package_id
+        )
         if package is None:
             raise DomainValidationError("package_id does not belong to this router's tenant")
+        validate_package_ownership(
+            package_tenant_id=package.tenant_id, session_tenant_id=session.tenant_id
+        )
         if package.status != PackageStatus.ACTIVE:
             raise DomainValidationError("This package is no longer available")
 
-        # The official TZS amount — server-derived from the package, never
-        # accepted from the client.
+        # THE authoritative amount. Server-derived from the package row,
+        # never from the request.
         amount = Decimal(package.price_tzs)
 
+        try:
+            normalized_phone = normalize_tz_phone(phone)
+        except ValueError as exc:
+            raise DomainValidationError(str(exc)) from exc
+
+        # --- abuse controls, before anything is created -----------------
+        decision = await CaptiveRateLimiter().check(
+            session_id=session.id, phone=normalized_phone, router_id=session.router_id
+        )
+        if not decision.allowed:
+            await write_audit_log(
+                self.db,
+                tenant_id=session.tenant_id,
+                actor_id=None,
+                action="captive_portal.rate_limited",
+                target_type="captive_session",
+                target_id=session.id,
+                metadata={"dimension": decision.dimension},
+            )
+            return CaptivePortalPaymentInitiateResult(
+                status="rate_limited",
+                message="Too many payment attempts. Please wait a few minutes and try again.",
+            )
+
+        # --- duplicate suppression: reuse, never re-send ----------------
+        existing = await self.transaction_repo.find_active_captive_attempt(
+            captive_session_id=session.id,
+            package_id=package.id,
+            payer_phone=normalized_phone,
+            non_terminal_statuses=_NON_TERMINAL_STATUSES,
+        )
+        if existing is not None:
+            # A double-click, refresh, second tab or HTTP retry lands here.
+            # The customer gets their ORIGINAL attempt back — no second
+            # transaction, and crucially no second STK to their handset.
+            await write_audit_log(
+                self.db,
+                tenant_id=session.tenant_id,
+                actor_id=None,
+                action="captive_portal.duplicate_attempt_suppressed",
+                target_type="transaction",
+                target_id=existing.id,
+                metadata={"captive_session_id": str(session.id)},
+            )
+            return CaptivePortalPaymentInitiateResult(
+                transaction_token=create_transaction_token(existing.id),
+                status="duplicate",
+                amount=amount,
+                currency=DEFAULT_CURRENCY,
+                message=(
+                    "We are already processing a payment request for this package. "
+                    "Check your phone for the payment prompt."
+                ),
+            )
+
         customer = await CustomerService(self.db).get_or_create_by_phone(
-            tenant_id=tenant_id, phone=phone
+            tenant_id=session.tenant_id, phone=normalized_phone
         )
-
         subscription = await SubscriptionService(self.db).create_awaiting_payment(
-            tenant_id=tenant_id, customer_id=customer.id, package_id=package.id
+            tenant_id=session.tenant_id, customer_id=customer.id, package_id=package.id
         )
 
-        reference = f"CP-{secrets.token_hex(8).upper()}"
+        provider = SelcomPaymentProvider(
+            self.db,
+            flow=CAPTIVE_PORTAL_SELCOM_FLOW,
+            finalize_payment=self._finalize_captive_payment,
+        )
+        reference = provider.new_reference()
+
         transaction = await self.transaction_repo.create(
-            tenant_id=tenant_id,
+            tenant_id=session.tenant_id,
             customer_id=customer.id,
             subscription_id=subscription.id,
-            transaction_type=TransactionType.CAPTIVE_PORTAL.value,
+            # Business flow and settling provider, set together from the
+            # flow constant so they cannot drift. This row IS a captive
+            # purchase AND IS settled by Selcom — that pairing is exactly
+            # why the two columns exist.
+            transaction_type=CAPTIVE_PORTAL_SELCOM_FLOW.transaction_type.value,
+            payment_provider=CAPTIVE_PORTAL_SELCOM_FLOW.payment_provider.value,
+            package_id=package.id,
+            router_id=session.router_id,
+            captive_session_id=session.id,
+            device_mac=session.mac_address,
+            payer_phone=normalized_phone,
             reference=reference,
             channel="captive_portal",
             amount=str(amount),
             currency=DEFAULT_CURRENCY,
-            # CollectionStatus, not the old lowercase "pending": one
-            # vocabulary for both payment families, so a single reconciler
-            # and a single set of terminal-status rules cover both. CREATED
-            # is the accurate starting point — the row exists locally and
-            # nothing has been sent to any provider.
             status=CollectionStatus.CREATED.value,
         )
 
-        # No provider is wired up for captive-portal payments yet, so no
-        # STK is ever requested and no provider is ever contacted — see
-        # this module's docstring. Stated as one honest constant rather
-        # than inferred from a call that could only ever fail.
-        #
-        # This is also why the row above deliberately carries NO
-        # payment_provider: it has not reached one. Reconciliation
-        # discovers work by payment_provider, so leaving it NULL is what
-        # keeps the sweep from querying Selcom's order-status for an
-        # order that was never created. CAPTIVE_PORTAL_SELCOM_FLOW above
-        # is what sets it, once initiation genuinely goes to Selcom.
-        provider_configured = False
+        # Single-use: spent now that an attempt genuinely exists, so a
+        # replayed token cannot open a second one.
+        await session_service.consume(session=session)
 
         await write_audit_log(
             self.db,
-            tenant_id=tenant_id,
+            tenant_id=session.tenant_id,
             actor_id=None,
             action="captive_portal.payment_initiated",
             target_type="transaction",
             target_id=transaction.id,
             metadata={
                 "reference": reference,
-                "provider_configured": provider_configured,
-                "mac_address": mac_address,
+                "package_id": str(package.id),
+                "router_id": str(session.router_id),
+                # Masked, never the raw msisdn.
+                "payer_phone_masked": mask_msisdn(normalized_phone),
+                "amount": str(amount),
             },
+        )
+
+        buyer_name = (
+            " ".join(part for part in (customer.first_name, customer.last_name) if part).strip()
+            or normalized_phone
+        )
+        buyer_email = customer.email or f"{normalized_phone}@customer.invalid"
+
+        # The SAME validated provider layer the tenant Collection flow
+        # uses. Signing, create-order-minimal, wallet-payment and the
+        # order-status state machine are NOT duplicated here.
+        transaction = await provider.create_order_and_send_stk(
+            transaction,
+            actor_id=None,
+            buyer_name=buyer_name,
+            buyer_email=buyer_email,
+            msisdn=normalized_phone,
+            amount=amount,
+            currency=DEFAULT_CURRENCY,
+            description=f"{package.name} - captive portal",
         )
 
         return CaptivePortalPaymentInitiateResult(
             transaction_token=create_transaction_token(transaction.id),
-            status="pending" if provider_configured else "provider_not_configured",
+            status="pending",
             amount=amount,
             currency=DEFAULT_CURRENCY,
+            message="Check your phone and approve the payment prompt.",
+        )
+
+    async def _finalize_captive_payment(
+        self, transaction: Transaction, status_data: OrderStatusData
+    ) -> None:
+        """What a verified COMPLETED payment means for this flow: credit
+        the tenant's wallet, through the tenant's own commercial terms,
+        exactly as a manual Collection does.
+
+        Invoked by SelcomPaymentProvider only after an authenticated
+        order-status query matched order_id, amount and currency exactly.
+        Deliberately does NOT activate access — see
+        app/services/captive_activation.py for why that must run in its
+        own transaction.
+        """
+        await WalletService(self.db).process_collection(
+            tenant_id=transaction.tenant_id,
+            gross_amount=Decimal(transaction.amount),
+            # Same reference_type as the tenant Collection flow so ledger
+            # queries stay uniform. The CAPTIVE_PORTAL identity lives in
+            # transaction_type, the description and the audit trail.
+            reference_type="selcom_collection",
+            reference_id=transaction.id,
+            description=f"Captive portal payment {transaction.reference}",
+        )
+        # Paid, access not yet granted — immediately visible to the retry
+        # sweep even if this process dies before activation is attempted.
+        await self.transaction_repo.update(
+            transaction, activation_status=ActivationStatus.PENDING.value
         )
 
     async def get_payment_status(self, *, token: str) -> CaptivePortalPaymentStatusResult:
+        """Everything the waiting screen is allowed to know about ONE
+        attempt.
+
+        Scoped by an opaque transaction token, never a database id, so a
+        client cannot enumerate or read anyone else's payment. What comes
+        back is a deliberate projection: coarse payment state, activation
+        state, the package and price the customer already agreed to, and a
+        masked phone. Never a wallet balance, a ledger entry, a commission
+        rate, a raw msisdn, or anything about another transaction.
+        """
         transaction_id = resolve_transaction_token(token)
         if transaction_id is None:
             return CaptivePortalPaymentStatusResult(status="not_found")
 
         # tenant_id=None: the token is the only thing establishing which
-        # transaction (and tenant) this is about — same principle as
-        # resolving a router token.
+        # transaction (and tenant) this is about.
         transaction = await self.transaction_repo.get_by_id(tenant_id=None, id=transaction_id)
         if transaction is None:
             return CaptivePortalPaymentStatusResult(status="not_found")
 
-        # The stored vocabulary is CollectionStatus; the public one is a
-        # deliberately coarse projection of it. Customers get "is my money
-        # gone / am I online / should I try again", never the provider's
-        # internal state machine. Anything unrecognised projects to
-        # "pending" — never to success.
-        if transaction.status != CollectionStatus.COMPLETED.value:
-            public = (
-                "failed"
-                if transaction.status in _PUBLIC_FAILED_STATUSES
-                else "pending"
+        package_name = None
+        if transaction.package_id is not None:
+            package = (
+                await self.db.execute(
+                    select(Package).where(Package.id == transaction.package_id)
+                )
+            ).scalar_one_or_none()
+            package_name = package.name if package is not None else None
+
+        common: dict[str, object] = {
+            "package_name": package_name,
+            "amount": transaction.amount,
+            "currency": transaction.currency,
+            "payer_phone_masked": (
+                mask_msisdn(transaction.payer_phone) if transaction.payer_phone else None
+            ),
+            "created_at": transaction.created_at,
+        }
+
+        # --- still being verified: the one state where telling the truth
+        # --- badly causes a double charge --------------------------------
+        if transaction.status in _UNDER_REVIEW_STATUSES:
+            return CaptivePortalPaymentStatusResult(
+                status="pending",
+                under_review=True,
+                message=(
+                    "We are still confirming your payment with your mobile money "
+                    "provider. Please do NOT pay again — if money left your account "
+                    "it will be applied to this purchase."
+                ),
+                **common,
             )
-            return CaptivePortalPaymentStatusResult(status=public)
+
+        if transaction.status in _PUBLIC_FAILED_STATUSES:
+            return CaptivePortalPaymentStatusResult(
+                status="failed",
+                message=(
+                    "The payment was not completed. You have not been charged for "
+                    "a plan you did not get. You can try again."
+                ),
+                **common,
+            )
+
+        if transaction.status != CollectionStatus.COMPLETED.value:
+            # CREATED / STK_SENT / PENDING / INPROGRESS, plus anything
+            # unrecognised — which projects here rather than to success.
+            return CaptivePortalPaymentStatusResult(
+                status="pending",
+                message="Check your phone and approve the payment prompt.",
+                **common,
+            )
+
+        # --- paid. Now: is access actually live? ------------------------
+        activation = _PUBLIC_ACTIVATION.get(transaction.activation_status or "", "pending")
+        result_common = {
+            **common,
+            "completed_at": transaction.completed_at,
+            "activated_at": transaction.activated_at,
+            "provider_reference": transaction.provider_reference,
+            "activation_status": activation,
+        }
+
+        if activation != "active":
+            # Paid but not yet online. Credentials are deliberately
+            # withheld: handing over a RADIUS password before provisioning
+            # succeeded would just produce a login FreeRADIUS rejects.
+            return CaptivePortalPaymentStatusResult(
+                status="completed",
+                message=(
+                    "Payment confirmed. We are setting up your internet access — "
+                    "this only takes a moment."
+                    if activation != "failed"
+                    else "Payment confirmed. We could not finish setting up your "
+                    "access automatically — our team has been notified and you "
+                    "have NOT been charged twice."
+                ),
+                **result_common,
+            )
 
         if transaction.subscription_id is None or transaction.customer_id is None:
-            return CaptivePortalPaymentStatusResult(status="completed")
+            return CaptivePortalPaymentStatusResult(
+                status="completed", **result_common
+            )
 
-        customer_result = await self.db.execute(
-            select(Customer).where(Customer.id == transaction.customer_id)
-        )
-        customer = customer_result.scalar_one_or_none()
+        customer = (
+            await self.db.execute(
+                select(Customer).where(Customer.id == transaction.customer_id)
+            )
+        ).scalar_one_or_none()
         if customer is None:
-            return CaptivePortalPaymentStatusResult(status="completed")
-
-        # Credentials are handed over only once access actually exists.
-        # A paid-but-not-yet-activated customer gets "completed" without
-        # them rather than credentials that FreeRADIUS would reject.
-        if transaction.activation_status != ActivationStatus.ACTIVE.value:
-            return CaptivePortalPaymentStatusResult(status="completed")
+            return CaptivePortalPaymentStatusResult(
+                status="completed", **result_common
+            )
 
         return CaptivePortalPaymentStatusResult(
             status="completed",
+            message="You are connected. Enjoy your internet.",
             login_username=customer.phone,
             login_password=derive_radius_password(transaction.subscription_id),
+            **result_common,
         )
 
     async def finalize_payment(self, *, transaction_id: UUID) -> None:

@@ -29,9 +29,15 @@ from app.schemas.captive_portal import (
     CaptivePortalPaymentInitiateResult,
     CaptivePortalPaymentStatusResult,
     CaptivePortalResolveResult,
+    CaptivePortalSessionRequest,
+    CaptivePortalSessionResult,
 )
 from app.schemas.common import ResourceListResponse
 from app.services.captive_portal import CaptivePortalService
+from app.services.captive_session import (
+    CaptivePortalSessionService,
+    CaptiveSessionError,
+)
 from app.services.packages import PackageService
 
 router = APIRouter()
@@ -124,6 +130,46 @@ async def get_captive_portal_packages(
 
 
 @router.post(
+    "/captive-portal/session",
+    response_model=CaptivePortalSessionResult,
+    status_code=201,
+)
+async def create_captive_portal_session(
+    payload: CaptivePortalSessionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> CaptivePortalSessionResult:
+    """Exchanges a long-lived, site-wide router token for a SHORT-LIVED,
+    single-use payment intent token.
+
+    The router token identifies a site and lives in every router's hotspot
+    config, so it is effectively public to anyone who has associated with
+    that AP. It must therefore not be what authorizes spending money. This
+    endpoint is the boundary between the two: the tenant is resolved from
+    the router server-side and recorded on the session, and the token
+    handed back expires and can only be spent once.
+    """
+    router_id = resolve_router_token(payload.router)
+    if router_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid router token")
+
+    service = CaptivePortalSessionService(db)
+    try:
+        token, session = await service.issue(
+            router_id=router_id, mac_address=payload.mac_address
+        )
+    except CaptiveSessionError as exc:
+        # One opaque failure for every reason (unknown router, signing key
+        # unset) so the endpoint cannot be probed for which is the case.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Payment sessions are unavailable on this network.",
+        ) from exc
+
+    await db.commit()
+    return CaptivePortalSessionResult(intent_token=token, expires_at=session.expires_at)
+
+
+@router.post(
     "/captive-portal/payments/initiate",
     response_model=CaptivePortalPaymentInitiateResult,
     status_code=201,
@@ -132,23 +178,21 @@ async def initiate_captive_portal_payment(
     payload: CaptivePortalPaymentInitiateRequest,
     db: AsyncSession = Depends(get_db),
 ) -> CaptivePortalPaymentInitiateResult:
+    """Starts one payment attempt.
+
+    The request carries an intent token, a package and a phone number, and
+    nothing financial — see CaptivePortalPaymentInitiateRequest for why
+    that is enforced by the model's shape rather than by validation.
+    """
     service = CaptivePortalService(db)
-    router_id = resolve_router_token(payload.router)
-    if router_id is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid router token")
-
-    tenant_id = await service.resolve_tenant_id_for_router(router_id)
-    if tenant_id is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Router not found")
-
     try:
         result = await service.initiate_payment(
-            tenant_id=tenant_id,
+            intent_token=payload.intent_token,
             package_id=payload.package_id,
             phone=payload.phone,
-            mac_address=payload.mac_address,
         )
     except DomainValidationError as exc:
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=exc.message
         ) from exc

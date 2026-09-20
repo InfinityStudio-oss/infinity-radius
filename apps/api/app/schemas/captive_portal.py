@@ -4,6 +4,7 @@ hotspot client needs to render a login/payment page. The client only ever
 carries `router` (a signed token), `mac`, and `dst` — see
 app/core/router_token.py and app/api/v1/public.py."""
 
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
@@ -49,34 +50,94 @@ class CaptivePortalPackageRead(BaseModel):
     device_limit: int
 
 
-class CaptivePortalPaymentInitiateRequest(BaseModel):
+class CaptivePortalSessionRequest(BaseModel):
+    """Starts a payment session from an already-signed router token."""
+
     router: str
-    package_id: UUID
-    phone: str
-    # Correlates the payment with the originating hotspot session for
-    # audit/troubleshooting only — never used to derive the charged
-    # amount, which always comes from the server-resolved package.
+    # Correlation/troubleshooting only. NEVER authentication: a MAC is
+    # trivially spoofable and is frequently absent (randomized MACs, or a
+    # redirect that did not carry one).
     mac_address: str | None = None
 
 
-PaymentInitiateStatus = Literal["pending", "provider_not_configured"]
+class CaptivePortalSessionResult(BaseModel):
+    """The short-lived credential authorizing ONE payment attempt.
+
+    Carries no tenant id, no router id and no nonce — everything that
+    matters is read server-side from the captive_sessions row the token
+    resolves to.
+    """
+
+    intent_token: str
+    expires_at: datetime
+
+
+class CaptivePortalPaymentInitiateRequest(BaseModel):
+    """Everything a browser may say about a payment.
+
+    Note what is ABSENT and cannot be added by a client: tenant_id, amount,
+    price, currency, commission, payment_provider. Those are not optional
+    fields that default server-side — they are not fields at all, so a
+    tampered request cannot carry them. A TZS 10,000 package is therefore
+    not payable as TZS 1 by any request shape this model accepts.
+    """
+
+    intent_token: str
+    package_id: UUID
+    phone: str
+
+
+PaymentInitiateStatus = Literal[
+    "pending",  # STK requested, awaiting the customer
+    "duplicate",  # an identical attempt was already live — reusing it
+    "provider_not_configured",
+    "unavailable",  # production gate closed
+    "rate_limited",
+]
 
 
 class CaptivePortalPaymentInitiateResult(BaseModel):
-    transaction_token: str
+    transaction_token: str | None = None
     status: PaymentInitiateStatus
-    amount: Money
-    currency: str
+    amount: Money | None = None
+    currency: str | None = None
+    # Customer-safe copy. Never an operator diagnostic, never a provider
+    # error, never anything that helps someone tune around a control.
+    message: str | None = None
 
 
 PaymentStatus = Literal["pending", "completed", "failed", "not_found"]
+# The customer-facing fulfillment state, kept separate from payment status
+# for the same reason the database columns are: "paid" and "online" are
+# different facts, and conflating them is how a paying customer gets told
+# their payment failed.
+ActivationPublicStatus = Literal["pending", "activating", "active", "failed"]
 
 
 class CaptivePortalPaymentStatusResult(BaseModel):
     status: PaymentStatus
-    # Present only once status == "completed" — this customer's own RADIUS
-    # credentials, needed to submit the router's hotspot login form. Never
-    # a database id; never shown for anyone else's transaction (the token
-    # itself is what proves this request is about this transaction).
+    # True only while the payment is genuinely still being verified
+    # (REQUIRES_REVIEW / AMBIGUOUS). The portal uses this to tell the
+    # customer NOT to pay again — the one message that prevents a double
+    # charge on a payment that may yet settle.
+    under_review: bool = False
+    activation_status: ActivationPublicStatus | None = None
+    package_name: str | None = None
+    amount: Money | None = None
+    currency: str | None = None
+    # 2557*****101 — never the raw msisdn.
+    payer_phone_masked: str | None = None
+    # The payment channel's own receipt id, which the customer also sees on
+    # their mobile-money SMS. Available on COMPLETED payments only.
+    provider_reference: str | None = None
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+    activated_at: datetime | None = None
+    # Plain-language copy for the portal to render directly.
+    message: str | None = None
+    # Present only once activation_status == "active" — this customer's own
+    # RADIUS credentials, needed to submit the router's hotspot login form.
+    # Withheld while access does not yet exist, so the portal can never
+    # hand over credentials FreeRADIUS would reject.
     login_username: str | None = None
     login_password: str | None = None
