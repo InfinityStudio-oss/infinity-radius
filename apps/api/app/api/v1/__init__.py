@@ -9,6 +9,7 @@ from app.api.v1.collections import router as collections_router
 from app.api.v1.customers import router as customers_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.internal_collections import router as internal_collections_router
+from app.api.v1.internal_diagnostics import router as internal_diagnostics_router
 from app.api.v1.internal_disbursements import router as internal_disbursements_router
 from app.api.v1.locations import router as locations_router
 from app.api.v1.onboarding import router as onboarding_router
@@ -71,6 +72,9 @@ api_router.include_router(
 )
 api_router.include_router(
     internal_collections_router, prefix="/internal", tags=["internal"]
+)
+api_router.include_router(
+    internal_diagnostics_router, prefix="/internal", tags=["internal"]
 )
 
 # --- Earlier-phase surfaces, kept for the dashboard shell's existing calls --
