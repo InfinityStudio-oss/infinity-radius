@@ -83,9 +83,18 @@ class OrderStatusData(BaseModel):
     creation_date: str | None = None
     amount: Decimal | None = None
     payment_status: str | None = None
-    # "Available on COMPLETED payments only" per Selcom's docs.
+    # The PAYMENT CHANNEL's own identifier — Selcom documents this exactly
+    # as "Unique transaction identifier from the payment channel.
+    # Available on COMPLETED payments only" (e.g. "DIK1X2R6BW"). It is NOT
+    # an echo of the transid we submit to wallet-payment; treating it as
+    # one sent a real successful payment to AMBIGUOUS on 2026-09-19. Stored
+    # as evidence, never compared for equality — see
+    # app/services/collections.py and docs/architecture.md.
     transid: str | None = None
     channel: str | None = None
+    # Selcom Gateway's own "PG unique payment identifier", also
+    # "Available on COMPLETED payments only" — a third identifier,
+    # distinct from both the channel transid and our own.
     reference: str | None = None
     # Documentation conflict (see docs/architecture.md): the worked JSON
     # example calls this field "phone", but the field-description table

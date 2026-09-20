@@ -48,13 +48,19 @@ class Transaction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True
     )
     reference: Mapped[str] = mapped_column(Text, nullable=False)
-    # Selcom Gateway's own payment identifier (order-status/webhook
-    # `data.reference`) — "Available on COMPLETED payments only" per
-    # Selcom's docs.
+    # PROVIDER-side evidence for a completed Collection, preferring the
+    # payment channel's own transid (order-status `data.transid`, e.g.
+    # "DIK1X2R6BW" — what the payer sees on their mobile-money SMS) and
+    # falling back to Selcom Gateway's `data.reference`. Both are
+    # "Available on COMPLETED payments only" per Selcom's docs. Evidence
+    # only — never a correlation key, never compared to collection_transid.
     provider_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Our own server-generated transid sent to wallet-payment (the STK
-    # request's own idempotency key) — echoed back by Selcom on
-    # completion. Never Selcom-supplied at request time.
+    # OUR OWN server-generated transid submitted to wallet-payment. Selcom
+    # does NOT echo this back: order-status's `transid` is the payment
+    # channel's identifier, a different value entirely. Assuming otherwise
+    # sent a genuinely successful production payment to AMBIGUOUS on
+    # 2026-09-19 — see docs/architecture.md. Never overwritten by any
+    # provider response.
     collection_transid: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Normalized 255XXXXXXXXX — the msisdn the STK prompt was sent to.
     payer_phone: Mapped[str | None] = mapped_column(Text, nullable=True)

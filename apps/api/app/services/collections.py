@@ -308,18 +308,19 @@ class CollectionService:
         payment_status = (status_data.payment_status or "").strip().upper()
 
         if payment_status == PAYMENT_STATUS_COMPLETED:
-            if (
-                transaction.collection_transid
-                and status_data.transid
-                and status_data.transid != transaction.collection_transid
-            ):
-                await self._transition(
-                    transaction,
-                    to_status=CollectionStatus.AMBIGUOUS,
-                    actor_id=actor_id,
-                    reason=f"transid mismatch: provider reported {status_data.transid}",
-                )
-                return
+            # NOTE: order-status's `transid` is deliberately NOT compared
+            # against transaction.collection_transid. They are different
+            # identifiers by definition — Selcom documents the response
+            # field as "Unique transaction identifier from the payment
+            # channel", i.e. the mobile-money operator's own reference
+            # (e.g. "DIK1X2R6BW"), whereas collection_transid is the id WE
+            # generated and submitted to wallet-payment. An earlier
+            # equality check between the two sent a genuinely COMPLETED
+            # production payment to AMBIGUOUS (2026-09-19, TZS 1,000) and
+            # would have done so for every successful payment. The
+            # provider transid is evidence, stored below — never a
+            # correlation key. order_id is the correlation key: we
+            # generate it and Selcom echoes it back.
             if status_data.order_id and status_data.order_id != transaction.reference:
                 await self._transition(
                     transaction,
@@ -357,16 +358,34 @@ class CollectionService:
                 reference_id=transaction.id,
                 description=f"Selcom Collection {status_data.reference or transaction.reference}",
             )
+            # Provider-side evidence, in order of usefulness for support
+            # and for reconciling against a payer's own mobile-money
+            # statement: the payment channel's transid first (what the
+            # customer sees on their SMS receipt), then Selcom Gateway's
+            # own `reference`. Both are "Available on COMPLETED payments
+            # only" per Selcom's docs, so either may be absent — absence is
+            # never treated as a failure, since this is evidence, not a
+            # financial control. transaction.collection_transid (ours) is
+            # deliberately never written here and stays intact.
             await self._transition(
                 transaction,
                 to_status=CollectionStatus.COMPLETED,
                 actor_id=actor_id,
                 reason="Payment verified COMPLETED via authenticated order-status query",
-                provider_reference=status_data.reference or transaction.provider_reference,
+                provider_reference=(
+                    status_data.transid
+                    or status_data.reference
+                    or transaction.provider_reference
+                ),
                 channel=status_data.channel,
                 provider_resultcode=provider_resultcode or "000",
                 provider_message="COMPLETED",
                 completed_at=datetime.now(UTC),
+                audit_metadata={
+                    "provider_channel_transid": status_data.transid,
+                    "provider_gateway_reference": status_data.reference,
+                    "local_request_transid": transaction.collection_transid,
+                },
             )
             return
 
@@ -455,6 +474,10 @@ class CollectionService:
             result=response.result,
             message=response.message,
             payment_status=response.first.payment_status if response.first else None,
+            # Both provider-side identifiers, kept distinct from our own
+            # collection_transid — see _apply_order_status.
+            provider_channel_transid=response.first.transid if response.first else None,
+            provider_gateway_reference=response.first.reference if response.first else None,
         )
         if response.first is None:
             return

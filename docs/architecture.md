@@ -1181,6 +1181,34 @@ service only — never worker, beat, Vercel, the Network Agent, or
 MikroTik, and never a `NEXT_PUBLIC_SELCOM_COLLECTION_*` frontend variable
 (none should ever exist).
 
+### Collection identifiers — three distinct things, never conflated
+
+A Collection order involves three different identifiers. Conflating two of
+them sent a genuinely successful TZS 1,000 production payment to
+`AMBIGUOUS` on 2026-09-19, leaving a real customer payment uncredited
+until the fix shipped:
+
+| Identifier | Who generates it | Where it appears | Role |
+|---|---|---|---|
+| `order_id` (our `transactions.reference`, `col-…`) | **Infinity Radius** | sent to create-order-minimal, **echoed back** by order-status | **The correlation key** — compared for exact equality |
+| local request transid (`transactions.collection_transid`, `txn-…`) | **Infinity Radius** | sent to wallet-payment | Our own request identifier. **Selcom never echoes it back.** Never overwritten by any provider response |
+| provider/channel transid (order-status `data.transid`, e.g. `DIK1X2R6BW`) | **the payment channel** (M-Pesa/Tigo/Airtel) | order-status, on COMPLETED only | **Evidence/receipt** — stored in `provider_reference`, never compared |
+
+Selcom's docs define the response field exactly as *"Unique transaction
+identifier from the payment channel. Available on COMPLETED payments
+only"* — it is the operator's reference, the one the payer sees on their
+own SMS receipt, not an echo of what we submitted. A fourth value,
+Selcom Gateway's own `data.reference` ("PG unique payment identifier"),
+is a third provider-side id; `provider_reference` stores the channel
+transid in preference to it, falling back when absent.
+
+**Why this matters:** an equality check between the local request transid
+and the provider/channel transid can never pass, so it silently converts
+every successful payment into `AMBIGUOUS`. The failure is safe (no credit,
+no guess) but total. Only `order_id`, `amount`, and `currency` are valid
+finalization controls; the provider transid and gateway reference are
+evidence, and their absence never blocks a finalization.
+
 ### Collection status model — hardened after the first live test (2026-09-19)
 
 The first controlled live Collection test (TZS 1,000 to an operator-owned

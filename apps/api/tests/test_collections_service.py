@@ -410,9 +410,63 @@ def test_amount_mismatch_moves_to_ambiguous_and_never_credits(
     assert count == 0
 
 
-def test_transid_mismatch_moves_to_ambiguous(
+def test_real_shape_completed_with_channel_transid_credits_and_stores_evidence(
     collection_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The exact shape of the real 2026-09-19 production payment: Selcom
+    returns its payment CHANNEL's transid ("DIK1X2R6BW"), which is not and
+    never was an echo of the transid we submitted to wallet-payment. This
+    must credit — an earlier equality check between the two sent a genuinely
+    successful TZS 1,000 payment to AMBIGUOUS."""
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        local_transid = transaction.collection_transid
+        reference = transaction.reference
+        assert local_transid is not None
+        assert local_transid.startswith("txn-")
+
+        async def _fake_order_status(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference,
+                transid="DIK1X2R6BW",  # payment channel's id, not ours
+                amount=_AMOUNT,
+                payment_status="COMPLETED",
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
+        asyncio.run(_reconcile(transaction_id))
+        after = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT entry_type, amount FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            ledger = cur.fetchall()
+
+    assert after.status == CollectionStatus.COMPLETED.value
+    # Channel transid stored as provider evidence...
+    assert after.provider_reference == "DIK1X2R6BW"
+    # ...and our own request transid is untouched.
+    assert after.collection_transid == local_transid
+    assert len(ledger) == 3
+    assert {row[0] for row in ledger} == {"COLLECTION", "PLATFORM_FEE", "TENANT_SHARE"}
+
+
+def test_completed_without_channel_transid_still_credits(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selcom documents transid/reference as "Available on COMPLETED
+    payments only", so either may be absent. They are evidence, not
+    financial controls — absence must never block a finalization whose
+    order_id/amount/currency all match."""
     with SeededContext() as ctx:
         tenant_id, actor_id = _seed_tenant(ctx)
         _fake_create_order_success(monkeypatch)
@@ -424,18 +478,104 @@ def test_transid_mismatch_moves_to_ambiguous(
         async def _fake_order_status(
             self: SelcomCollectionClient, **kwargs: object
         ) -> OrderStatusResponse:
-            return _order_status_response(
-                order_id=reference,
-                transid="some-other-transaction-entirely",
-                amount=_AMOUNT,
-                payment_status="COMPLETED",
+            return OrderStatusResponse(
+                reference=reference,
+                resultcode="000",
+                result="SUCCESS",
+                data=[
+                    {
+                        "order_id": reference,
+                        "amount": _AMOUNT,
+                        "payment_status": "COMPLETED",
+                        # no transid, no reference
+                    }
+                ],
             )
 
         monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_order_status)
         asyncio.run(_reconcile(transaction_id))
         after = asyncio.run(_get_transaction(transaction_id))
 
-    assert after.status == CollectionStatus.AMBIGUOUS.value
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            count = cur.fetchone()[0]
+
+    assert after.status == CollectionStatus.COMPLETED.value
+    assert count == 3
+
+
+def test_ambiguous_self_heals_to_completed_on_next_reconciliation(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery path for the real incident: a transaction already sitting
+    in AMBIGUOUS (non-terminal, still swept) must finalize correctly on a
+    later authenticated COMPLETED, crediting exactly once, with no manual
+    intervention."""
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        _fake_create_order_success(monkeypatch)
+        _fake_wallet_payment_success(monkeypatch)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+        local_transid = transaction.collection_transid
+        reference = transaction.reference
+
+        # Drive it into AMBIGUOUS first, via an amount mismatch.
+        async def _fake_bad_amount(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference,
+                transid="DIK1X2R6BW",
+                amount=Decimal("1"),
+                payment_status="COMPLETED",
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_bad_amount)
+        asyncio.run(_reconcile(transaction_id))
+        mid = asyncio.run(_get_transaction(transaction_id))
+        assert mid.status == CollectionStatus.AMBIGUOUS.value
+
+        # AMBIGUOUS must still be swept.
+        async def _list() -> list[UUID]:
+            async with AsyncSessionLocal() as db:
+                rows = await CollectionService(db).list_reconcilable_collections()
+                return [r.id for r in rows]
+
+        assert transaction_id in asyncio.run(_list())
+
+        # Now the provider reports the truth.
+        async def _fake_good(
+            self: SelcomCollectionClient, **kwargs: object
+        ) -> OrderStatusResponse:
+            return _order_status_response(
+                order_id=reference,
+                transid="DIK1X2R6BW",
+                amount=_AMOUNT,
+                payment_status="COMPLETED",
+            )
+
+        monkeypatch.setattr(SelcomCollectionClient, "order_status", _fake_good)
+        asyncio.run(_reconcile(transaction_id))
+        asyncio.run(_reconcile(transaction_id))  # duplicate — must not double-credit
+        final = asyncio.run(_get_transaction(transaction_id))
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM ledger_entries WHERE reference_id = %s",
+                (str(transaction_id),),
+            )
+            count = cur.fetchone()[0]
+
+    assert final.status == CollectionStatus.COMPLETED.value
+    assert final.provider_reference == "DIK1X2R6BW"
+    assert final.collection_transid == local_transid
+    assert count == 3
 
 
 def test_order_id_mismatch_moves_to_ambiguous(
