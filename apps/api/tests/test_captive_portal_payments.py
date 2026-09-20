@@ -397,3 +397,178 @@ def test_full_payment_flow_reaches_completed_with_radius_credentials(gate_open: 
             assert tenant_share_entry["reference_id"] == str(transaction_id)
         finally:
             _cleanup_radius(username="255712345671", package_id=package_id)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-20 captive HTTP 403 investigation.
+#
+# A real controlled captive payment was rejected by Selcom's production
+# create-order-minimal with a bare HTTP 403, before any STK was sent. The
+# manual Collection flow had sent a real STK from the same web service the
+# day before using the identical shared provider code
+# (SelcomPaymentProvider.create_order_and_send_stk). Comparing the two
+# request constructions field-by-field found exactly one structural
+# difference: captive always populated merchant_remarks (from the
+# package name), while the manual flow's known-good call left it unset
+# (CollectionCreate.description defaults to None, and manual Collection's
+# successful test never supplied one). Selcom's Signed-Fields header is
+# built dynamically from whatever fields are actually present in the
+# request (see create_order_minimal), so this is a genuine difference in
+# what gets signed and sent, not merely cosmetic.
+#
+# These tests pin the fix (captive no longer sends description at all)
+# and the accompanying customer-response bug: a failed order creation
+# was being reported to the customer as "pending — check your phone",
+# which would tell them to wait for an STK that was never sent.
+# ---------------------------------------------------------------------------
+
+
+def test_create_order_never_sends_merchant_remarks(
+    gate_open: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Captive's create-order-minimal request must be structurally
+    identical to the validated manual Collection request when no
+    merchant description is supplied — never add a field the known-good
+    flow doesn't send."""
+    from app.integrations.selcom_collection.client import SelcomCollectionClient
+
+    captured: dict[str, object] = {}
+
+    async def _capturing_create_order(self, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(SelcomCollectionClient, "create_order_minimal", _capturing_create_order)
+
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        headers = auth_header(user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id))
+        router_id, package_id = _create_router_and_package(headers)
+        router_token = client.get(
+            f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
+        ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
+
+        client.post(
+            "/api/v1/public/captive-portal/payments/initiate",
+            json={"intent_token": intent, "package_id": package_id, "phone": "0755900010"},
+        )
+
+    assert captured.get("merchant_remarks") is None
+
+
+def test_initiate_payment_reports_failed_when_order_creation_fails(
+    gate_open: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact bug found live: a failed create-order-minimal must never
+    be reported to the customer as 'pending — check your phone'. No STK
+    can have been sent (wallet_payment is never reached), so telling the
+    customer to wait for one is actively misleading."""
+    from app.integrations.selcom_collection.client import SelcomCollectionClient
+    from app.integrations.selcom_collection.errors import SelcomCollectionAPIError
+
+    wallet_calls = {"n": 0}
+
+    async def _forbidden_create_order(self, **kwargs):
+        raise SelcomCollectionAPIError(
+            "Selcom Collection returned 403",
+            status_code=403,
+            raw_response={"result": "FAIL", "message": "synthetic test rejection"},
+        )
+
+    async def _counting_wallet_payment(self, **kwargs):
+        wallet_calls["n"] += 1
+        return SimpleNamespace(resultcode="111", message="PENDING")
+
+    monkeypatch.setattr(SelcomCollectionClient, "create_order_minimal", _forbidden_create_order)
+    monkeypatch.setattr(SelcomCollectionClient, "wallet_payment", _counting_wallet_payment)
+
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        headers = auth_header(user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id))
+        router_id, package_id = _create_router_and_package(headers)
+        router_token = client.get(
+            f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
+        ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
+
+        response = client.post(
+            "/api/v1/public/captive-portal/payments/initiate",
+            json={"intent_token": intent, "package_id": package_id, "phone": "0755900011"},
+        )
+        assert response.status_code == 201
+        body = response.json()
+
+        # The bug: this used to be "pending".
+        assert body["status"] == "failed", body
+        assert "check your phone" not in (body.get("message") or "").lower()
+
+        transaction_id = resolve_transaction_token(body["transaction_token"])
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, collection_transid, stk_requested_at "
+                "FROM transactions WHERE id = %s",
+                (str(transaction_id),),
+            )
+            status, transid, stk_at = cur.fetchone()
+
+    assert status == "FAILED"
+    # Order creation failed first — the STK step must never have run.
+    assert wallet_calls["n"] == 0
+    assert transid is None
+    assert stk_at is None
+
+
+def test_manual_and_captive_send_identical_create_order_fields(
+    gate_open: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct parity check between the two flows through the shared
+    provider, with no description/merchant_remarks on either side — the
+    validated manual shape and the fixed captive shape must produce the
+    exact same field set (order_id and buyer identifiers aside)."""
+    from app.integrations.selcom_collection.client import SelcomCollectionClient
+
+    captured_calls: list[dict[str, object]] = []
+
+    async def _capturing_create_order(self, **kwargs):
+        captured_calls.append(dict(kwargs))
+        return None
+
+    monkeypatch.setattr(SelcomCollectionClient, "create_order_minimal", _capturing_create_order)
+
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        headers = auth_header(user_id=ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id))
+
+        # Manual Collection leg — no description supplied.
+        client.post(
+            "/api/v1/collections",
+            headers=headers,
+            json={"amount": "1500", "currency": "TZS", "phone": "0755900012"},
+        )
+
+        # Captive leg.
+        router_id, package_id = _create_router_and_package(headers)
+        router_token = client.get(
+            f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
+        ).json()["data"]["router_token"]
+        intent = _open_session(router_token)
+        client.post(
+            "/api/v1/public/captive-portal/payments/initiate",
+            json={"intent_token": intent, "package_id": package_id, "phone": "0755900013"},
+        )
+
+    assert len(captured_calls) == 2
+    manual_call, captive_call = captured_calls
+    # order_id and buyer_phone/buyer_name/buyer_email are EXPECTED business
+    # identifiers that differ (different phone numbers, different
+    # generated order references) — the assertion is on request SHAPE,
+    # not on these specific values.
+    ignorable = {"order_id", "buyer_phone", "buyer_name", "buyer_email"}
+    manual_shape = {k: v for k, v in manual_call.items() if k not in ignorable}
+    captive_shape = {k: v for k, v in captive_call.items() if k not in ignorable}
+    assert manual_shape == captive_shape
+    # Confirm the field SET itself matches too, including the keys we
+    # excluded from the value comparison above.
+    assert set(manual_call.keys()) == set(captive_call.keys())

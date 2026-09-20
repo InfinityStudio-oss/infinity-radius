@@ -365,6 +365,18 @@ class CaptivePortalService:
         # The SAME validated provider layer the tenant Collection flow
         # uses. Signing, create-order-minimal, wallet-payment and the
         # order-status state machine are NOT duplicated here.
+        #
+        # description is deliberately left unset (None), matching the
+        # validated manual Collection request exactly — see the
+        # 2026-09-20 captive HTTP 403 investigation. merchant_remarks is
+        # the one field this call used to add that the manual flow's
+        # known-good request never sends, which also changes the
+        # dynamically-built Signed-Fields set (see
+        # app/integrations/selcom_collection/client.py's
+        # create_order_minimal — merchant_remarks is only included in the
+        # signed request when non-None). The package name has no
+        # functional use on Selcom's side; it is not worth carrying a
+        # request-shape delta from the validated path to send it.
         transaction = await provider.create_order_and_send_stk(
             transaction,
             actor_id=None,
@@ -373,15 +385,29 @@ class CaptivePortalService:
             msisdn=normalized_phone,
             amount=amount,
             currency=DEFAULT_CURRENCY,
-            description=f"{package.name} - captive portal",
+            description=None,
         )
+
+        # Report what genuinely happened, not an assumed success. The two
+        # only possible outcomes of create_order_and_send_stk are
+        # STK_SENT (both provider calls succeeded) or FAILED (either one
+        # didn't) — see that method. Telling a customer to check a phone
+        # that will never buzz is worse than an honest failure message.
+        if transaction.status == CollectionStatus.STK_SENT.value:
+            return CaptivePortalPaymentInitiateResult(
+                transaction_token=create_transaction_token(transaction.id),
+                status="pending",
+                amount=amount,
+                currency=DEFAULT_CURRENCY,
+                message="Check your phone and approve the payment prompt.",
+            )
 
         return CaptivePortalPaymentInitiateResult(
             transaction_token=create_transaction_token(transaction.id),
-            status="pending",
+            status="failed",
             amount=amount,
             currency=DEFAULT_CURRENCY,
-            message="Check your phone and approve the payment prompt.",
+            message="We could not start this payment. Please try again in a moment.",
         )
 
     async def _finalize_captive_payment(

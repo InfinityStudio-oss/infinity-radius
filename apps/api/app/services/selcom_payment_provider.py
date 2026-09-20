@@ -255,6 +255,16 @@ class SelcomPaymentProvider:
                 f"{self._flow.log_namespace}.create_order_failed",
                 transaction_id=str(transaction.id),
                 error=str(exc),
+                status_code=getattr(exc, "status_code", None),
+                # Selcom's own response body — the exact evidence needed
+                # to tell an application-level rejection (bad field,
+                # unauthorized vendor, ...) apart from a transport/edge
+                # block, which was missing entirely during the
+                # 2026-09-20 captive 403 investigation: the exception
+                # carried it, but nothing ever logged it, so it was lost
+                # the moment the request finished. Selcom's own error
+                # response never contains our secrets.
+                provider_response=getattr(exc, "raw_response", None),
             )
             await self.fail(transaction, reason=f"Order creation failed: {exc}", actor_id=actor_id)
             return transaction
@@ -269,6 +279,8 @@ class SelcomPaymentProvider:
                 f"{self._flow.log_namespace}.wallet_payment_failed",
                 transaction_id=str(transaction.id),
                 error=str(exc),
+                status_code=getattr(exc, "status_code", None),
+                provider_response=getattr(exc, "raw_response", None),
             )
             await self.fail(transaction, reason=f"STK request failed: {exc}", actor_id=actor_id)
             return transaction

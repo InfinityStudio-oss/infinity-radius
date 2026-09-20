@@ -93,6 +93,13 @@ PaymentInitiateStatus = Literal[
     "provider_not_configured",
     "unavailable",  # production gate closed
     "rate_limited",
+    # Order creation or the wallet-payment STK call itself failed — no
+    # STK was ever sent. Distinct from "unavailable": the gate was open
+    # and the attempt genuinely reached the provider, it just didn't
+    # succeed. Never reported as "pending" — see the 2026-09-20 captive
+    # HTTP 403 investigation, where doing so told a customer to check a
+    # phone that would never buzz.
+    "failed",
 ]
 
 
