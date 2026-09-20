@@ -12,6 +12,9 @@ dependencies = [
   "python-dotenv>=1.0,<2.0",
   "pyyaml>=6.0,<7.0",
   "structlog>=24.4,<25.0",
+  # Writes RADIUS user/group rows to this VPS's LOCAL FreeRADIUS
+  # PostgreSQL — see app/services/radius_provisioning.py.
+  "psycopg[binary]>=3.2,<4.0",
 ]
 
 [project.optional-dependencies]

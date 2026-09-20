@@ -30,6 +30,7 @@ from app.services.captive_activation import (
     run_activation,
 )
 from app.services.captive_portal import CaptivePortalService
+from app.services.radius_provisioning import RadiusUnavailableError
 from tests.db_fixtures import SeededContext
 
 _PRICE = Decimal("1500.00")
@@ -102,13 +103,17 @@ async def _ledger_rows(tenant_id: UUID) -> list[tuple[str, str]]:
 
 
 def _break_radius(monkeypatch: pytest.MonkeyPatch, message: str = "RADIUS is down") -> None:
-    """Simulates the real production failure: FreeRADIUS unreachable."""
+    """Simulates the real production failure: no RADIUS transport reachable.
 
-    async def _boom(**_kwargs: object) -> None:
-        raise RuntimeError(message)
+    Patched at the transport boundary (provision_access) rather than at one
+    specific backend, so the test covers the Network Agent path and the
+    direct-database path identically — which is the point of having that
+    abstraction."""
 
-    monkeypatch.setattr(activation_module, "sync_package_radius_group", _boom)
-    monkeypatch.setattr(activation_module, "provision_customer_radius_access", _boom)
+    async def _boom(**_kwargs: object) -> str:
+        raise RadiusUnavailableError(message)
+
+    monkeypatch.setattr(activation_module, "provision_access", _boom)
 
 
 # ----------------------------------------------------- status vocabulary

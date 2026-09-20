@@ -39,11 +39,8 @@ from app.db.session import AsyncSessionLocal
 from app.models.network import Customer, Package, Subscription
 from app.repositories.finance import TransactionRepository
 from app.services.audit import write_audit_log
-from app.services.radius_sync import (
-    derive_radius_password,
-    provision_customer_radius_access,
-    sync_package_radius_group,
-)
+from app.services.radius_provisioning import describe_transport, provision_access
+from app.services.radius_sync import derive_radius_password
 from app.services.subscriptions import SubscriptionService
 
 logger = structlog.get_logger("services.captive_activation")
@@ -131,14 +128,18 @@ class CaptivePortalActivationService:
                 subscription_id=subscription.id,
             )
 
-        # The step that genuinely fails in production. Both calls are
-        # upserts against the FreeRADIUS schema, so re-running them is safe.
-        # NOTE: radius_sync commits to a SEPARATE database on its own
-        # session, so it is not covered by this transaction either way —
-        # another reason activation must never share the payment's.
+        # The step that genuinely fails in production. Provisioning is an
+        # upsert through whichever transport is configured (Network Agent
+        # in production, direct database locally — see
+        # app/services/radius_provisioning.py), so re-running it is safe.
+        # NOTE: it writes to a SEPARATE system entirely and is not covered
+        # by this transaction either way — another reason activation must
+        # never share the payment's.
         try:
-            await sync_package_radius_group(
+            transport = await provision_access(
+                customer_phone=customer.phone,
                 package_id=package.id,
+                radius_password=derive_radius_password(subscription.id),
                 download_speed_kbps=package.download_speed_kbps,
                 upload_speed_kbps=package.upload_speed_kbps,
                 session_timeout_seconds=(
@@ -146,15 +147,11 @@ class CaptivePortalActivationService:
                 ),
                 simultaneous_sessions=package.simultaneous_sessions,
             )
-            await provision_customer_radius_access(
-                customer_phone=customer.phone,
-                package_id=package.id,
-                radius_password=derive_radius_password(subscription.id),
-            )
         except Exception as exc:  # noqa: BLE001 — any provisioning failure is recoverable
             logger.warning(
                 "captive_activation.radius_provisioning_failed",
                 transaction_id=str(transaction_id),
+                transport=describe_transport(),
                 error=str(exc),
             )
             raise ActivationFailedError(f"RADIUS provisioning failed: {exc}") from exc
@@ -171,7 +168,12 @@ class CaptivePortalActivationService:
             action="captive_portal.access_activated",
             target_type="transaction",
             target_id=transaction.id,
-            metadata={"subscription_id": str(subscription.id)},
+            metadata={
+                "subscription_id": str(subscription.id),
+                # Which path actually granted access — the first thing to
+                # check when access works in one environment and not another.
+                "transport": transport,
+            },
         )
         return ActivationStatus.ACTIVE
 

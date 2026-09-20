@@ -124,6 +124,62 @@ class NetworkAgentClient:
         data = await self._request("GET", f"/routers/{router_id}/radius-status")
         return [RadiusClientStatus.model_validate(item) for item in data]
 
+    # --- RADIUS provisioning -------------------------------------------
+    # These do NOT take a router_id: they act on the VPS's own local
+    # FreeRADIUS database, not on a MikroTik. They live here because this
+    # client is already the authenticated, signed channel to that VPS —
+    # which is precisely what makes exposing the RADIUS database to the
+    # internet unnecessary.
+
+    async def radius_ping(self) -> bool:
+        """True if the agent can reach its local RADIUS database. Lets the
+        caller distinguish 'not configured' from 'down' before attempting
+        to provision."""
+        data = await self._request("GET", "/radius/ping")
+        return bool(data.get("reachable", False))
+
+    async def sync_radius_package_group(
+        self,
+        *,
+        package_id: UUID,
+        download_speed_kbps: int | None,
+        upload_speed_kbps: int | None,
+        session_timeout_seconds: int | None,
+        simultaneous_sessions: int,
+    ) -> None:
+        await self._request(
+            "POST",
+            "/radius/package-group",
+            json_body={
+                "package_id": str(package_id),
+                "download_speed_kbps": download_speed_kbps,
+                "upload_speed_kbps": upload_speed_kbps,
+                "session_timeout_seconds": session_timeout_seconds,
+                "simultaneous_sessions": simultaneous_sessions,
+            },
+        )
+
+    async def provision_radius_user(
+        self, *, username: str, package_id: UUID, password: str
+    ) -> None:
+        """The password is derived by this process from the subscription id
+        and never stored; it crosses to the agent inside a signed request
+        over TLS and is never logged on either side."""
+        await self._request(
+            "POST",
+            "/radius/user",
+            json_body={
+                "username": username,
+                "package_id": str(package_id),
+                "password": password,
+            },
+        )
+
+    async def revoke_radius_user(self, *, username: str) -> None:
+        await self._request(
+            "POST", "/radius/user/revoke", json_body={"username": username}
+        )
+
     async def diagnostic_ping(self) -> tuple[bool, int]:
         """Authenticated reachability probe for the Super Admin diagnostics
         endpoint. Every Network Agent route requires a router UUID, so this

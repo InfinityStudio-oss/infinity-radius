@@ -63,3 +63,16 @@ celery_app.conf.beat_schedule = {
         "schedule": 180.0,
     },
 }
+
+# Captive activation retries are scheduled ONLY when explicitly enabled.
+# The task is always registered (so it can be invoked manually and is
+# covered by tests), but scheduling it before a RADIUS provisioning
+# transport exists would just retry every paid-but-unactivated payment on
+# a loop, fail every time, and bury real alerts under its own noise.
+# Enable it in the same change that provisions the transport — see
+# app/services/radius_provisioning.py.
+if settings.captive_activation_retry_enabled:
+    celery_app.conf.beat_schedule["retry-captive-activations"] = {
+        "task": "infinity_radius.retry_captive_activations",
+        "schedule": float(settings.captive_activation_retry_interval_seconds),
+    }

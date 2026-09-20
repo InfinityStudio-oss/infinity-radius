@@ -67,6 +67,11 @@ class NetworkAgentSettings(BaseSettings):
     # way as freeradius itself (systemctl is-active), so /health never
     # needs a second set of DB credentials on top of FreeRADIUS's own.
     radius_db_service_name: str = "postgresql"
+    # Connection string for the LOCAL FreeRADIUS PostgreSQL on this VPS.
+    # Always a localhost/unix-socket DSN — this value is what makes it
+    # unnecessary to expose the database to the internet, so pointing it
+    # at a public host would defeat its entire purpose.
+    radius_database_dsn: str | None = None
 
     @field_validator("allowed_source_ips", mode="before")
     @classmethod
