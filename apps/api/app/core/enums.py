@@ -129,6 +129,47 @@ class TransactionType(StrEnum):
     CAPTIVE_PORTAL = "CAPTIVE_PORTAL"  # app/services/captive_portal.py
 
 
+class PaymentProvider(StrEnum):
+    """WHICH PROVIDER processed a `transactions` row — a different question
+    from TransactionType, which says which business flow it belongs to.
+
+    Both are needed because the two answers cross: a captive-portal package
+    payment settled through Selcom Mobile Checkout is
+    transaction_type=CAPTIVE_PORTAL + payment_provider=SELCOM_COLLECTION,
+    and must be reconciled exactly like a tenant Collection even though it
+    must never appear in the tenant Collections dashboard.
+
+    Reconciliation discovers work by THIS column, never by transaction_type
+    — so a future non-Selcom captive payment is never sent to Selcom's
+    order-status endpoint. Nullable in the database: rows that predate the
+    column, and captive-portal rows that never reached any provider, stay
+    NULL rather than being guessed (see c4f81b2e9a37).
+    """
+
+    SELCOM_COLLECTION = "SELCOM_COLLECTION"  # Selcom Mobile Checkout
+
+
+class ActivationStatus(StrEnum):
+    """Whether ACCESS has been activated — deliberately NOT the same column
+    as payment status.
+
+    A payment can be verified COMPLETED while activation fails (RADIUS
+    unreachable, for instance). Overloading one column would make that state
+    indistinguishable from "not paid", which is the one confusion that must
+    never happen: the customer has already been charged. Keeping them apart
+    is what lets activation be retried without ever re-charging anyone.
+
+    Nullable in the database — NULL means this row has not entered the
+    fulfillment lifecycle at all.
+    """
+
+    PENDING = "PENDING"  # payment verified, activation not started
+    ACTIVATING = "ACTIVATING"  # in progress
+    ACTIVE = "ACTIVE"  # access granted
+    FAILED = "FAILED"  # activation failed — retryable, payment stands
+    REQUIRES_REVIEW = "REQUIRES_REVIEW"  # repeated failure, needs an operator
+
+
 class CollectionStatus(StrEnum):
     """A Selcom Mobile Checkout Collection order's lifecycle — see
     app/services/collections.py and app/integrations/selcom_collection/

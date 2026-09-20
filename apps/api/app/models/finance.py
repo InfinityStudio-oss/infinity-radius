@@ -82,6 +82,40 @@ class Transaction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # --- captive-portal payment context (c4f81b2e9a37) ---------------------
+    # All nullable with no default: `transactions` holds live production
+    # rows, and nothing populates these yet. See that revision for why each
+    # one exists.
+
+    # WHICH PROVIDER processed this payment — deliberately separate from
+    # transaction_type, which says which BUSINESS FLOW it belongs to. A
+    # captive-portal payment paid through Selcom must be reconciled exactly
+    # like a tenant Collection; a future voucher/cash one must never be sent
+    # to Selcom's order-status at all. app.core.enums.PaymentProvider.
+    payment_provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # What was bought. Reachable via subscription.package_id only when a
+    # subscription exists — useless for a payment that never completed.
+    package_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("packages.id", ondelete="SET NULL"), nullable=True
+    )
+    # Which site the payment came from — the first thing support asks.
+    router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("routers.id", ondelete="SET NULL"), nullable=True
+    )
+    # The client MAC, when the hotspot redirect carried one. Accepted by the
+    # captive portal API today but currently kept only in audit metadata.
+    device_mac: Mapped[str | None] = mapped_column(Text, nullable=True)
+    captive_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("captive_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    # PAYMENT VERIFIED and ACCESS ACTIVATED are different facts, kept in
+    # different columns on purpose: overloading `status` with both would make
+    # "paid but activation failed" indistinguishable from "not paid" — the one
+    # confusion that must never happen, since the customer has already been
+    # charged. app.core.enums.ActivationStatus.
+    activation_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
 
 class PaymentWebhook(UUIDPrimaryKeyMixin, Base):
     """Raw inbound payment-provider callbacks, kept verbatim for audit/replay.

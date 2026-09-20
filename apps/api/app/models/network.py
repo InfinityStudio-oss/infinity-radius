@@ -210,6 +210,44 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     )
 
 
+class CaptiveSession(UUIDPrimaryKeyMixin, Base):
+    """One authorized captive-portal visit — the server-side half of the
+    short-lived payment session token a hotspot customer holds.
+
+    Exists so that token can be made SINGLE-USE and EXPIRING, which a
+    stateless token cannot be on its own: `nonce` is unique, so a replayed
+    token cannot open a second session, and `consumed_at` records when it
+    was spent. Deliberately distinct from `user_sessions`, which is a
+    RADIUS-accounting record of an established connection — this is the
+    pre-payment authorization that may never become one.
+
+    created_at only, no updated_at: rows are written once and then only
+    ever stamped `consumed_at`. NOTHING READS OR WRITES THIS TABLE YET —
+    added by c4f81b2e9a37 ahead of the captive payment flow.
+    """
+
+    __tablename__ = "captive_sessions"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    router_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("routers.id", ondelete="CASCADE"), nullable=False
+    )
+    # Genuinely optional: a real MikroTik redirect carries one, local/dev
+    # testing without a router does not.
+    mac_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NOT NULL on purpose, on a table that starts empty so it costs nothing:
+    # a NULL nonce would defeat the single-use replay protection, and a NULL
+    # expiry would be a credential that never expires.
+    nonce: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class VoucherBatch(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "voucher_batches"
 
