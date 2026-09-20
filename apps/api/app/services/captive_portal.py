@@ -164,6 +164,14 @@ class CaptivePortalService:
         self.tenant_repo = TenantRepository(db)
         self.package_repo = PackageRepository(db)
         self.transaction_repo = TransactionRepository(db)
+        # Exposed the same way CollectionService exposes its own, so the
+        # shared provider layer's cross-flow dispatch
+        # (SelcomPaymentProvider._provider_for — see the 2026-09-20
+        # incident) can reach this flow's finalizer from outside this
+        # class without re-implementing it.
+        self.provider = SelcomPaymentProvider(
+            db, flow=CAPTIVE_PORTAL_SELCOM_FLOW, finalize_payment=self._finalize_captive_payment
+        )
 
     async def resolve_tenant_id_for_router(self, router_id: UUID) -> UUID | None:
         """The one place a router token turns into a tenant — everything
@@ -306,12 +314,7 @@ class CaptivePortalService:
             tenant_id=session.tenant_id, customer_id=customer.id, package_id=package.id
         )
 
-        provider = SelcomPaymentProvider(
-            self.db,
-            flow=CAPTIVE_PORTAL_SELCOM_FLOW,
-            finalize_payment=self._finalize_captive_payment,
-        )
-        reference = provider.new_reference()
+        reference = self.provider.new_reference()
 
         transaction = await self.transaction_repo.create(
             tenant_id=session.tenant_id,
@@ -377,7 +380,7 @@ class CaptivePortalService:
         # signed request when non-None). The package name has no
         # functional use on Selcom's side; it is not worth carrying a
         # request-shape delta from the validated path to send it.
-        transaction = await provider.create_order_and_send_stk(
+        transaction = await self.provider.create_order_and_send_stk(
             transaction,
             actor_id=None,
             buyer_name=buyer_name,
@@ -438,6 +441,20 @@ class CaptivePortalService:
         await self.transaction_repo.update(
             transaction, activation_status=ActivationStatus.PENDING.value
         )
+
+    async def reconcile(self, *, transaction_id: UUID) -> Transaction:
+        """The captive-portal counterpart of CollectionService.reconcile.
+
+        In practice this is only ever reached via
+        SelcomPaymentProvider._provider_for's cross-flow dispatch — the
+        shared webhook and the payment_provider-scoped reconciliation
+        sweep both discover transactions by payment_provider, not by
+        transaction_type, so either can hand a CAPTIVE_PORTAL id to
+        CollectionService's own reconcile path. Exposed directly here too
+        so a captive-specific caller never has to go through
+        CollectionService to reach it.
+        """
+        return await self.provider.reconcile(transaction_id=transaction_id)
 
     async def get_payment_status(self, *, token: str) -> CaptivePortalPaymentStatusResult:
         """Everything the waiting screen is allowed to know about ONE

@@ -102,6 +102,28 @@ _PAYMENT_STATUS_TO_COLLECTION_STATUS: dict[str, CollectionStatus] = {
 _NON_TERMINAL_MAPPED_TARGETS = frozenset({CollectionStatus.PENDING, CollectionStatus.INPROGRESS})
 
 
+class SelcomPaymentFlowMismatchError(Exception):
+    """A transaction was about to be finalized by a flow that doesn't own
+    it — see the 2026-09-20 production incident.
+
+    A CAPTIVE_PORTAL payment was reconciled through CollectionService's
+    own provider (COLLECTION_FLOW). The wallet was credited correctly
+    (both flows' finalizers call the identical WalletService.
+    process_collection), but activation_status was never set, because
+    CollectionService's finalizer has no notion of activation — and once
+    a transaction reaches a terminal status, apply_order_status's own
+    idempotency guard means it can never be finalized again by anyone,
+    correct flow included. The money was safe; the customer's access was
+    silently never provisioned.
+
+    This is raised by apply_order_status as a hard backstop, and is not
+    expected to be reachable in normal operation: query_and_apply/
+    reconcile/process_webhook all resolve the correct flow via
+    SelcomPaymentProvider._provider_for before ever calling
+    apply_order_status on a transaction they don't own.
+    """
+
+
 @dataclass(frozen=True)
 class SelcomPaymentFlow:
     """The ONLY things that differ between two Selcom-backed payment
@@ -331,6 +353,17 @@ class SelcomPaymentProvider:
         even over a transaction previously flagged REQUIRES_REVIEW —
         REQUIRES_REVIEW is only ever a waiting-room, never a status that
         blocks a later authoritative result."""
+        if transaction.transaction_type != self._flow.transaction_type.value:
+            # Hard backstop, not expected to fire in normal operation —
+            # see SelcomPaymentFlowMismatchError. Checked BEFORE the
+            # terminal-status no-op below on purpose: a mismatched flow
+            # must never even reach the "already resolved" branch, or a
+            # caller could mistake a loud rejection for a quiet success.
+            raise SelcomPaymentFlowMismatchError(
+                f"{self._flow.log_namespace} cannot finalize transaction {transaction.id} "
+                f"(transaction_type={transaction.transaction_type!r}, "
+                f"expected {self._flow.transaction_type.value!r})"
+            )
         if transaction.status in COLLECTION_TERMINAL_STATUSES:
             return  # already resolved — idempotent no-op
 
@@ -509,15 +542,55 @@ class SelcomPaymentProvider:
             provider_resultcode=response.resultcode,
         )
 
+    def _provider_for(self, transaction: Transaction) -> "SelcomPaymentProvider":
+        """Returns the provider that actually owns `transaction`'s flow —
+        `self` if it already matches, otherwise the correct sibling
+        flow's provider on the SAME db session.
+
+        Exists because the shared webhook and the payment_provider-scoped
+        reconciliation sweep both discover transactions ACROSS flow
+        boundaries by design (see list_reconcilable): the flow whose code
+        happens to receive a transaction_id/order_id is not necessarily
+        the flow that created it. See the 2026-09-20 incident this fixes,
+        and SelcomPaymentFlowMismatchError for what happens if this is
+        ever bypassed.
+
+        Deferred imports: both flow modules import THIS one (they
+        construct a SelcomPaymentProvider), so importing them at module
+        scope here would be circular.
+        """
+        if transaction.transaction_type == self._flow.transaction_type.value:
+            return self
+        if transaction.transaction_type == TransactionType.COLLECTION.value:
+            from app.services.collections import CollectionService
+
+            return CollectionService(self.db).provider
+        if transaction.transaction_type == TransactionType.CAPTIVE_PORTAL.value:
+            from app.services.captive_portal import CaptivePortalService
+
+            return CaptivePortalService(self.db).provider
+        raise SelcomPaymentFlowMismatchError(
+            f"No Selcom payment flow is registered for transaction_type="
+            f"{transaction.transaction_type!r} (transaction {transaction.id})"
+        )
+
     async def reconcile(self, *, transaction_id: UUID) -> Transaction:
         """Public entry point for both the Super Admin-visible internal
         HMAC endpoint (worker-triggered) and any manual operator action —
         never called by a webhook directly (see process_webhook, which
-        looks up by reference first)."""
+        looks up by reference first).
+
+        Dispatches to the transaction's OWN flow via _provider_for before
+        finalizing — this is what makes it safe for the payment_provider-
+        scoped reconciliation sweep to call this on a transaction_id it
+        discovered without knowing (or needing to know) which flow
+        created it.
+        """
         transaction = await self.repo.get_by_id_for_update(tenant_id=None, id=transaction_id)
         if transaction is None:
             raise NotFoundError("Collection transaction not found")
-        await self.query_and_apply(transaction=transaction, actor_id=None)
+        target = self._provider_for(transaction)
+        await target.query_and_apply(transaction=transaction, actor_id=None)
         return transaction
 
     async def list_reconcilable(self) -> list[Transaction]:
@@ -560,14 +633,13 @@ class SelcomPaymentProvider:
         request we sign ourselves) before ever touching a wallet. See
         app/api/v1/webhooks.py for the route.
 
-        One Selcom callback URL serves every flow, so the row this finds
-        by order_id is finalized with THIS provider's finalizer. That is
-        correct while Collection is the only flow reaching Selcom. When a
-        second one does, this must dispatch on
-        `transaction.transaction_type` to that flow's own provider before
-        calling query_and_apply — otherwise a captive-portal payment
-        would be finalized as a plain tenant Collection and never
-        activate its package.
+        One Selcom callback URL serves every flow. The row this finds by
+        order_id is dispatched via _provider_for to the flow that
+        actually created it before query_and_apply ever runs — fixed
+        2026-09-20 after a captive-portal payment was finalized as a
+        plain tenant Collection (wallet credited correctly, but never
+        activated, and un-fixable after the fact once terminal) because
+        this used to always finalize with THIS provider's own flow.
         """
         webhook_repo = PaymentWebhookRepository(self.db)
         try:
@@ -629,14 +701,15 @@ class SelcomPaymentProvider:
             return {"status": "unknown_reference"}
 
         await webhook_repo.update(webhook_row, tenant_id=transaction.tenant_id)
+        target = self._provider_for(transaction)
         await write_audit_log(
             self.db,
             tenant_id=transaction.tenant_id,
             actor_id=None,
-            action=f"{self._flow.audit_namespace}.webhook_received",
+            action=f"{target._flow.audit_namespace}.webhook_received",
             target_type="transaction",
             target_id=transaction.id,
         )
-        await self.query_and_apply(transaction=transaction, actor_id=None)
+        await target.query_and_apply(transaction=transaction, actor_id=None)
         await webhook_repo.update(webhook_row, processed=True, processed_at=datetime.now(UTC))
         return {"status": "acknowledged"}
