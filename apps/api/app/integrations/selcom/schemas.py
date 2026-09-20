@@ -6,71 +6,19 @@ Field NAMES here are Infinity Radius's own internal vocabulary, chosen for
 clarity — they are NOT Selcom's actual JSON field names, which remain
 unknown until official API documentation is supplied. The real request/
 response (de)serialization against Selcom's actual schema belongs in
-collection.py/disbursement.py once that mapping is confirmed; nothing in
+disbursement.py once that mapping is confirmed; nothing in
 this file should be treated as "the Selcom wire format."
 
-`CollectionCallbackPayload` deliberately carries only the raw, unparsed
-webhook body — inventing field names for it (a "reference" key, an
-"amount" key, a "status" key) before official documentation confirms them
-is exactly the mistake this module exists to avoid.
+`DisbursementCallbackPayload` deliberately carries only the raw,
+unparsed webhook body — inventing field names for it (a "reference" key,
+an "amount" key, a "status" key) before official documentation confirms
+them is exactly the mistake this module exists to avoid.
 """
 
 from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field
-
-
-class CollectionOrderRequest(BaseModel):
-    """What Infinity Radius needs Selcom to collect from a customer.
-
-    TODO(selcom-docs): map these to Selcom's actual Collection API request
-    fields (vendor/merchant id, order id, buyer details, amount, currency,
-    payment method, etc.) once the official integration guide is
-    available — see app/integrations/selcom/collection.py.
-    """
-
-    reference: str
-    amount: Decimal
-    currency: str
-    customer_phone: str
-    # Only ever a real customer-supplied email, or None — never a
-    # fabricated/placeholder address (e.g. "noreply@..."). Selcom's
-    # Collection API may or may not require this field; until docs confirm
-    # it, a missing email must stay a missing email, not an invented one.
-    customer_email: str | None = None
-
-
-class CollectionOrderResponse(BaseModel):
-    """TODO(selcom-docs): populate from Selcom's real Collection order-
-    creation response. `provider_reference` stands in for whatever
-    Selcom's own order/transaction identifier field is actually called."""
-
-    provider_reference: str | None = None
-    raw_response: dict[str, Any] = Field(default_factory=dict)
-
-
-class CollectionStatusResponse(BaseModel):
-    """TODO(selcom-docs): populate from Selcom's real order-status query
-    response. `result_code`/`result_message` are placeholders for
-    whatever Selcom's actual status vocabulary is — do not assume any
-    particular code (e.g. "0000") means success without the official
-    specification confirming it."""
-
-    provider_reference: str | None = None
-    result_code: str | None = None
-    result_message: str | None = None
-    raw_response: dict[str, Any] = Field(default_factory=dict)
-
-
-class CollectionCallbackPayload(BaseModel):
-    """The inbound webhook's real field names are TODO(selcom-docs) —
-    this only carries the parsed-JSON payload verbatim. See
-    CollectionService.verify_callback / process_callback, which persist
-    this raw shape (app.models.finance.PaymentWebhook.payload) regardless
-    of whether it can yet be acted on."""
-
-    raw: dict[str, Any]
 
 
 class DisbursementOrderRequest(BaseModel):

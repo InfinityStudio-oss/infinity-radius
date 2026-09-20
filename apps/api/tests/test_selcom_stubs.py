@@ -1,9 +1,13 @@
-"""Every real outbound Selcom operation (order creation, status query,
-request signing/auth, webhook signature verification) is a documented
-TODO pending official Selcom API documentation — these tests prove each
-one fails LOUDLY and typed (never silently "succeeds" or returns a
-guessed value), and that the two failure modes (missing credentials vs.
-code genuinely not implemented yet) are distinguishable.
+"""Every remaining legacy Selcom operation (disbursement submission and
+status query, request signing/auth, webhook signature verification) is a
+documented TODO pending official Selcom API documentation — these tests
+prove each one fails LOUDLY and typed (never silently "succeeds" or
+returns a guessed value), and that the two failure modes (missing
+credentials vs. code genuinely not implemented yet) are distinguishable.
+
+Collection is NOT covered here any more: it is fully implemented against
+Selcom Mobile Checkout and tested in test_collections_service.py /
+test_collections_webhook.py. Its never-implementable stub was removed.
 """
 
 from decimal import Decimal
@@ -11,11 +15,10 @@ from decimal import Decimal
 import pytest
 
 from app.integrations.selcom.authentication import SelcomAuthenticator
-from app.integrations.selcom.client import SelcomClient
 from app.integrations.selcom.config import SelcomConfig
 from app.integrations.selcom.disbursement import SelcomDisbursementService
 from app.integrations.selcom.exceptions import SelcomNotConfiguredError, SelcomNotImplementedError
-from app.integrations.selcom.schemas import CollectionOrderRequest, DisbursementOrderRequest
+from app.integrations.selcom.schemas import DisbursementOrderRequest
 from app.integrations.selcom.signatures import sign_request, verify_webhook_signature
 
 _UNCONFIGURED = SelcomConfig(api_base_url=None, api_key=None, api_secret=None, merchant_id=None)
@@ -35,40 +38,6 @@ def test_selcom_disbursement_enabled_defaults_to_false() -> None:
     from app.core.config import Settings
 
     assert Settings.model_fields["selcom_disbursement_enabled"].default is False
-
-
-async def test_initiate_collection_without_credentials_raises_not_configured() -> None:
-    client = SelcomClient(_UNCONFIGURED)
-    with pytest.raises(SelcomNotConfiguredError):
-        await client.collection.initiate_collection(
-            CollectionOrderRequest(
-                reference="ref",
-                amount=Decimal("1000"),
-                currency="TZS",
-                customer_phone="255712345678",
-            )
-        )
-
-
-async def test_initiate_collection_with_credentials_raises_not_implemented() -> None:
-    """Configured credentials alone can never make this succeed — the
-    request/response schema itself is still undocumented."""
-    client = SelcomClient(_CONFIGURED)
-    with pytest.raises(SelcomNotImplementedError):
-        await client.collection.initiate_collection(
-            CollectionOrderRequest(
-                reference="ref",
-                amount=Decimal("1000"),
-                currency="TZS",
-                customer_phone="255712345678",
-            )
-        )
-
-
-async def test_query_collection_raises_not_implemented() -> None:
-    client = SelcomClient(_CONFIGURED)
-    with pytest.raises(SelcomNotImplementedError):
-        await client.collection.query_collection(provider_reference="anything")
 
 
 async def test_initiate_disbursement_without_credentials_raises_not_configured() -> None:

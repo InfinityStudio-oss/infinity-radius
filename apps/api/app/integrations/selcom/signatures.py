@@ -12,9 +12,9 @@ Guessing any of this would produce code that looks like it works but is
 silently insecure or simply wrong — this is exactly why
 `verify_webhook_signature` must never return True until it is a real,
 documented check: doing otherwise would let anyone forge a "payment
-succeeded" callback (see app/integrations/selcom/collection.py, which
-never marks a transaction SUCCESS unless this function has genuinely
-verified the request).
+succeeded" callback (see app/integrations/selcom/disbursement.py, which
+never finalizes a payout unless this function has genuinely verified the
+request).
 """
 
 from app.integrations.selcom.config import SelcomConfig

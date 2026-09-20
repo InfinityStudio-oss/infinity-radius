@@ -1,11 +1,10 @@
 """The captive portal's payment flow: initiate -> poll (pending) ->
 [payment confirmation, simulated here by calling
-CaptivePortalService.mark_transaction_completed directly rather than via
-POST /api/v1/webhooks/selcom/collection — see test_selcom_webhook.py for
-the real end-to-end webhook route, and app/services/captive_portal.py's
-module docstring for why the webhook can't yet verify anything for real]
--> poll (completed, with RADIUS login credentials) -> real RADIUS rows
-and a real wallet ledger credit exist.
+CaptivePortalService.mark_transaction_completed directly, since no
+payment provider is wired up to captive-portal payments yet — see
+app/services/captive_portal.py's module docstring] -> poll (completed,
+with RADIUS login credentials) -> real RADIUS rows and a real wallet
+ledger credit exist.
 """
 
 import asyncio
@@ -48,8 +47,8 @@ def _cleanup_radius(*, username: str, package_id: str) -> None:
 
 
 async def _mark_completed_directly(transaction_id: UUID) -> None:
-    """Stands in for the (not-yet-buildable) Selcom webhook — see this
-    file's module docstring."""
+    """Stands in for the payment provider that captive-portal payments
+    are not yet wired to — see this file's module docstring."""
     async with AsyncSessionLocal() as db:
         await CaptivePortalService(db).mark_transaction_completed(transaction_id=transaction_id)
         await db.commit()

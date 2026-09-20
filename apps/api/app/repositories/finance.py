@@ -29,7 +29,7 @@ class TransactionRepository(BaseRepository[Transaction]):
     async def get_by_reference(self, *, reference: str) -> Transaction | None:
         """Tenant-agnostic on purpose: a webhook callback identifies a
         transaction by the internal reference we generated at initiation
-        time (see app.integrations.selcom.collection), before we know
+        time (see app.services.selcom_payment_provider), before we know
         which tenant it belongs to from the request alone — the same
         principle as resolving a router/transaction token."""
         stmt = select(Transaction).where(Transaction.reference == reference)

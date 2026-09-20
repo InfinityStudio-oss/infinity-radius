@@ -5,17 +5,21 @@ package and gives a phone number, a Transaction + PENDING Subscription are
 created, and a safe public transaction token lets the waiting screen poll
 status — never a database id.
 
-Payment confirmation (`mark_transaction_completed`) is what
-`POST /api/v1/webhooks/selcom/collection`
-(app/integrations/selcom/collection.py's CollectionService.process_callback)
-calls once a callback is genuinely verified. That verification step
-itself is still a documented TODO pending Selcom's official API docs (see
-app/integrations/selcom/signatures.py) — so this method is real, reachable,
-and directly tested (activation, RADIUS provisioning, the wallet's
+NO PAYMENT PROVIDER IS WIRED UP HERE YET. `initiate_payment` creates the
+Transaction and PENDING Subscription and then reports
+`provider_not_configured` — it contacts nobody. It previously called a
+legacy Selcom Collection stub that could only ever raise, which has been
+removed; the observable result is unchanged, and deliberately so.
+
+The validated Mobile Checkout provider that will replace it lives in
+app/services/selcom_payment_provider.py, already shared with the tenant
+Collection flow. Wiring it up is a later phase — see docs/architecture.md.
+
+Payment confirmation (`mark_transaction_completed`) is therefore real,
+directly tested (activation, RADIUS provisioning, the wallet's
 gross -> platform fee / tenant share split via WalletService.process_collection,
-and the audit trail all genuinely happen), but nothing external can
-trigger it for real money yet, because nothing can yet prove a callback is
-authentically from Selcom.
+and the audit trail all genuinely happen) but currently reachable only
+from tests, since nothing yet initiates a real captive-portal payment.
 """
 
 import secrets
@@ -25,15 +29,10 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.core.enums import PackageStatus, TransactionType
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.money import DEFAULT_CURRENCY
 from app.core.transaction_token import create_transaction_token, resolve_transaction_token
-from app.integrations.selcom.client import SelcomClient
-from app.integrations.selcom.config import SelcomConfig
-from app.integrations.selcom.exceptions import SelcomNotConfiguredError, SelcomNotImplementedError
-from app.integrations.selcom.schemas import CollectionOrderRequest
 from app.models.network import Customer, Package, Subscription
 from app.repositories.billing import PackageRepository
 from app.repositories.finance import TransactionRepository
@@ -53,16 +52,6 @@ from app.services.radius_sync import (
 )
 from app.services.subscriptions import SubscriptionService
 from app.services.wallet import WalletService
-
-
-def selcom_config_from_settings() -> SelcomConfig:
-    settings = get_settings()
-    return SelcomConfig(
-        api_base_url=settings.selcom_api_base_url,
-        api_key=settings.selcom_api_key,
-        api_secret=settings.selcom_api_secret,
-        merchant_id=settings.selcom_merchant_id,
-    )
 
 
 class CaptivePortalService:
@@ -131,28 +120,11 @@ class CaptivePortalService:
             status="pending",
         )
 
-        provider_configured = True
-        selcom = SelcomClient(selcom_config_from_settings())
-        try:
-            order_response = await selcom.collection.initiate_collection(
-                CollectionOrderRequest(
-                    reference=reference,
-                    amount=amount,
-                    currency=DEFAULT_CURRENCY,
-                    customer_phone=customer.phone,
-                    # Only ever a real customer-supplied email, never a
-                    # placeholder — customer.email is None for the common
-                    # phone-only captive-portal signup.
-                    customer_email=customer.email,
-                )
-            )
-        except (SelcomNotConfiguredError, SelcomNotImplementedError):
-            provider_configured = False
-        else:
-            if order_response.provider_reference:
-                transaction = await self.transaction_repo.update(
-                    transaction, provider_reference=order_response.provider_reference
-                )
+        # No provider is wired up for captive-portal payments yet, so no
+        # STK is ever requested and no provider is ever contacted — see
+        # this module's docstring. Stated as one honest constant rather
+        # than inferred from a call that could only ever fail.
+        provider_configured = False
 
         await write_audit_log(
             self.db,
@@ -208,12 +180,16 @@ class CaptivePortalService:
         )
 
     async def mark_transaction_completed(self, *, transaction_id: UUID) -> None:
-        """Called by CollectionService.process_callback once (and only
-        once) a Selcom Collection callback has been genuinely verified,
-        its reference/amount/state validated against this transaction, and
-        idempotency confirmed (not already processed). Activates the
+        """Finalizes one captive-portal payment: activates the
         subscription, credits the tenant's wallet, provisions RADIUS
         access, and writes the audit trail — all real, all tested.
+
+        Guarded by the `status != "pending"` check below so a repeated
+        call can never double-activate or double-credit. No production
+        caller reaches this yet; when captive-portal payments are wired
+        to SelcomPaymentProvider, this becomes that flow's
+        `finalize_payment`, invoked only after an authenticated
+        order-status query has verified the payment COMPLETED.
         """
         transaction = await self.transaction_repo.get_by_id(tenant_id=None, id=transaction_id)
         if transaction is None:

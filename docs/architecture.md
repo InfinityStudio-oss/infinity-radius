@@ -86,7 +86,7 @@ print('radius db configured:', s.radius_database_url is not None)"
 database calls are mocked):
 
 ```bash
-pytest tests/test_radius_sync.py tests/test_captive_portal_payments.py tests/test_selcom_webhook.py
+pytest tests/test_radius_sync.py tests/test_captive_portal_payments.py
 ```
 
 **Reset only the local RADIUS database** (never touches Supabase or
@@ -235,45 +235,59 @@ router then redirects the browser to `dst` itself.
 
 ## Payments
 
-Selcom Collection (customer payments) and Disbursement (provider payouts)
-are integrated behind `apps/api/app/integrations/selcom/`:
+Selcom **Collection** (customer payments) is fully implemented against
+Selcom Mobile Checkout and validated on real production payments — see
+"Selcom Mobile Checkout Collection" below. The provider-generic half of
+it lives in `apps/api/app/services/selcom_payment_provider.py`
+(`SelcomPaymentProvider`), which owns signing, order creation, the STK
+push, the authenticated order-status state machine and webhook handling,
+and knows nothing about which business flow a payment belongs to. Each
+flow supplies a `SelcomPaymentFlow` (its `transaction_type`, reference
+prefix, audit/log namespaces) and a `finalize_payment` callback; the
+tenant Collection flow's façade is `app/services/collections.py`.
+
+`POST /api/v1/webhooks/selcom-collection/checkout` is the single
+Collection callback. It verifies a real signature and is then treated as
+a SIGNAL ONLY — an authenticated order-status query this process signs
+itself is what actually finalizes anything.
+
+Selcom **Disbursement** (provider payouts) still sits behind the older
+`apps/api/app/integrations/selcom/`:
 
 ```
-client.py          # SelcomClient facade — .collection / .disbursement
-collection.py      # initiate_collection / query_collection / verify_callback / process_callback
-disbursement.py    # create_disbursement / query_disbursement (thin, mirrors collection.py)
+client.py          # SelcomClient facade — .disbursement
+disbursement.py    # create_disbursement / query_disbursement
 authentication.py  # outbound request auth — TODO(selcom-docs)
 signatures.py      # outbound request signing + inbound webhook verification — TODO(selcom-docs)
 schemas.py         # Infinity Radius's own field names, not Selcom's wire format
 exceptions.py      # SelcomNotConfiguredError vs SelcomNotImplementedError, etc.
-config.py          # SelcomConfig — api_base_url/api_key/api_secret/merchant_id
+config.py          # SelcomConfig + selcom_config_from_settings()
 ```
 
 No endpoint path, auth header, signature format, or webhook field name is
-invented anywhere in this package — every place Selcom's official
+invented anywhere in that package — every place Selcom's official
 documentation needs to be mapped in is a `TODO(selcom-docs)` that raises
 `SelcomNotImplementedError` (distinct from `SelcomNotConfiguredError`,
 which just means credentials are unset) until it's filled in for real.
+Note that production payouts run through the separate, real
+`app/integrations/selcom_business/` integration; this legacy package
+covers only the older, unimplemented disbursement path.
 
-`POST /api/v1/webhooks/selcom/collection` (`apps/api/app/api/v1/webhooks.py`)
-is real and reachable, and always saves the raw callback (`PaymentWebhook`)
-regardless of outcome — but `verify_webhook_signature` always raises
-today, so nothing can be marked SUCCESS through it yet: every webhook
-currently comes back `{"status": "unverified"}`. Once verification is
-real, `CollectionService.process_callback` validates the claimed
-reference/amount/state against the stored `Transaction`, applies
-idempotency (a transaction not still `pending` is a no-op "duplicate",
-never re-applied), and — only then — calls
-`CaptivePortalService.mark_transaction_completed`, which activates the
-subscription, splits the gross amount into the tenant's `PLATFORM_FEE` and
-`TENANT_SHARE` ledger entries and credits its pending balance
-(`WalletService.process_collection`, row-locked against concurrent
-collections — see "Tenant finance accounting" below), syncs RADIUS, and
-writes the audit trail. All of that downstream logic is real
-and tested today (`apps/api/tests/test_selcom_webhook.py` simulates a
-verified callback by monkeypatching only the verification/field-extraction
-boundary, never touching runtime code) — it's specifically the
-authenticity check that awaits Selcom's official documentation.
+A matching legacy Collection stub (`collection.py`) and its
+`POST /api/v1/webhooks/selcom/collection` route were **removed** once the
+Mobile Checkout integration replaced them: they could never verify a
+callback, so nothing could ever be marked paid through them.
+
+**Captive-portal payments are not wired to any provider yet.**
+`CaptivePortalService.initiate_payment` creates the `Transaction` and a
+PENDING `Subscription`, then returns `provider_not_configured` without
+contacting anyone. `mark_transaction_completed` — which activates the
+subscription, splits the gross amount into the tenant's `PLATFORM_FEE`
+and `TENANT_SHARE` ledger entries and credits its pending balance
+(`WalletService.process_collection`, row-locked), syncs RADIUS, and
+writes the audit trail — is real and tested
+(`apps/api/tests/test_captive_portal_payments.py`), but is reachable only
+from tests until that wiring lands.
 
 The captive portal never sends an authoritative payment amount — the
 charged amount always comes from the server-resolved `package.price_tzs`,

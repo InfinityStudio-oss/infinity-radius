@@ -115,7 +115,7 @@ class SuperAdminDashboardService:
 
         # Honest definition of "failed" given today's schema: a callback
         # that was actually run through verification and rejected — see
-        # app/integrations/selcom/collection.py. Rows still sitting at
+        # app/services/selcom_payment_provider.py. Rows still sitting at
         # signature_verified=false, processed=false mean "not yet
         # verifiable" (Selcom's real signing scheme is undocumented), not
         # "failed" — counting those would overstate real failures.

@@ -51,4 +51,4 @@ class SelcomAPIError(SelcomError):
 class SelcomWebhookVerificationError(SelcomError):
     """Raised when an inbound Selcom webhook fails authenticity
     verification. A request that raises this is never processed as a real
-    payment event — see app/integrations/selcom/collection.py."""
+    payment event — see app/integrations/selcom/disbursement.py."""

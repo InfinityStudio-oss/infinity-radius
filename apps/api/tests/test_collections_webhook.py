@@ -1,7 +1,8 @@
 """POST /api/v1/webhooks/selcom-collection/checkout — Selcom Mobile
-Checkout's Collection callback. Unlike the legacy captive-portal webhook
-(tests/test_selcom_webhook.py) and the Business Disbursement webhook
-(unsigned per Selcom's own docs), this one DOES carry a real
+Checkout's Collection callback, and the ONLY Collection callback — the
+older /selcom/collection route was removed with its never-implementable
+stub. Unlike the Business Disbursement webhook (unsigned per Selcom's own
+docs), this one DOES carry a real
 Authorization/Digest-Method/Digest/Timestamp/Signed-Fields signature — so
 these tests build genuinely valid signed requests (using the same
 sign_request the real client would use) rather than monkeypatching

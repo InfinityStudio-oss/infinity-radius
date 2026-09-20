@@ -1,10 +1,17 @@
 """External payment-provider webhooks. No Supabase auth here — these are
 called by the provider's own servers, not our frontend — authenticity is
-established by verifying the provider's own request signature instead
-(app.integrations.selcom.signatures, currently a documented TODO pending
-Selcom's official API documentation). Until that exists, every inbound
-callback is saved (audit trail) but never acted on — see
-app.integrations.selcom.collection.CollectionService.process_callback.
+established by verifying the provider's own request signature instead.
+
+Selcom Mobile Checkout Collection (/selcom-collection/checkout) is the
+one fully-implemented path: it verifies a real signature and then treats
+the callback as a SIGNAL ONLY, re-querying order-status itself before
+anything financial happens. It is the single Collection callback — an
+older, never-implementable /selcom/collection route was removed once the
+real Mobile Checkout integration replaced it.
+
+The Disbursement callbacks below remain gated on signature schemes that
+are still a documented TODO (app.integrations.selcom.signatures), so an
+inbound callback there is saved for audit but never acted on.
 """
 
 import contextlib
@@ -18,45 +25,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
 from app.db.session import get_db
-from app.integrations.selcom.collection import CollectionService
+from app.integrations.selcom.config import selcom_config_from_settings
 from app.integrations.selcom.disbursement import SelcomDisbursementService
 from app.integrations.selcom.exceptions import SelcomAPIError, SelcomWebhookVerificationError
 from app.repositories.finance import PaymentWebhookRepository, WithdrawalRepository
-from app.services.captive_portal import selcom_config_from_settings
-from app.services.collections import CollectionService as CheckoutCollectionService
+from app.services.collections import CollectionService
 from app.services.payouts import PayoutService
 
 logger = structlog.get_logger("webhooks.selcom")
 
 router = APIRouter()
-
-
-@router.post("/selcom/collection")
-async def selcom_collection_webhook(
-    request: Request, db: AsyncSession = Depends(get_db)
-) -> dict[str, str]:
-    body = await request.body()
-    headers = dict(request.headers)
-
-    service = CollectionService(selcom_config_from_settings())
-
-    try:
-        result = await service.process_callback(db, headers=headers, body=body)
-    except SelcomWebhookVerificationError as exc:
-        await db.rollback()
-        logger.warning("selcom.webhook.verification_failed", detail=str(exc))
-        # 200 on purpose even on rejection: Selcom's retry behavior on a
-        # non-2xx response isn't documented, and this must never let a
-        # forged retry distinguish "signature rejected" from any other
-        # outcome via the HTTP status code alone.
-        return {"status": "rejected"}
-    except SelcomAPIError as exc:
-        await db.rollback()
-        logger.error("selcom.webhook.processing_error", detail=str(exc))
-        return {"status": "error"}
-
-    await db.commit()
-    return {"status": result.status}
 
 
 @router.api_route("/selcom-business/disbursement", methods=["GET", "HEAD"])
@@ -180,7 +158,7 @@ async def selcom_collection_checkout_webhook(
     body = await request.body()
     headers = dict(request.headers)
 
-    service = CheckoutCollectionService(db)
+    service = CollectionService(db)
     try:
         result = await service.process_webhook(headers=headers, body=body)
     except Exception:  # noqa: BLE001 — never let a malformed/hostile inbound
