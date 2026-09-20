@@ -117,6 +117,47 @@ def test_initiate_payment_creates_pending_transaction_and_subscription() -> None
     assert "customer_id" not in body
 
 
+def test_initiate_payment_writes_the_captive_portal_discriminator() -> None:
+    """`transactions` is shared with Selcom Collection, so every captive
+    portal row must classify itself explicitly — otherwise it would either
+    be invisible or, worse, show up in a tenant's Collections list."""
+    with SeededContext() as ctx:
+        tenant_id = ctx.new_tenant()
+        user_id = ctx.new_user(role_code="TENANT_ADMIN", tenant_id=tenant_id)
+        headers = auth_header(user_id=user_id)
+
+        router_id = client.post(
+            "/api/v1/routers", headers=headers, json={"name": "Router"}
+        ).json()["data"]["id"]
+        package_id = client.post(
+            "/api/v1/packages",
+            headers=headers,
+            json={"name": "Pkg", "price_tzs": "1500", "status": "active"},
+        ).json()["data"]["id"]
+        router_token = client.get(
+            f"/api/v1/routers/{router_id}/provisioning/public-token", headers=headers
+        ).json()["data"]["router_token"]
+
+        initiate_response = client.post(
+            "/api/v1/public/captive-portal/payments/initiate",
+            json={"router": router_token, "package_id": package_id, "phone": "0712345678"},
+        )
+        transaction_id = resolve_transaction_token(
+            initiate_response.json()["transaction_token"]
+        )
+
+        assert ctx._conn is not None
+        with ctx._conn.cursor() as cur:
+            cur.execute(
+                "SELECT transaction_type FROM transactions WHERE id = %s",
+                (str(transaction_id),),
+            )
+            row = cur.fetchone()
+
+    assert row is not None
+    assert row[0] == "CAPTIVE_PORTAL"
+
+
 def test_initiate_payment_records_mac_address_in_the_audit_trail() -> None:
     """mac_address correlates the payment with the originating hotspot
     session for audit/troubleshooting only — it must never affect the

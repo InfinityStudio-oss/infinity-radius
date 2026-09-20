@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import func, select
 
+from app.core.pagination import ListParams
 from app.models.finance import (
     LedgerEntry,
     PaymentWebhook,
@@ -22,7 +23,7 @@ from app.repositories.base import BaseRepository
 class TransactionRepository(BaseRepository[Transaction]):
     model = Transaction
     search_fields = ("reference", "channel")
-    filterable_fields = ("status", "channel", "customer_id")
+    filterable_fields = ("status", "channel", "customer_id", "transaction_type")
     sortable_fields = ("created_at", "amount", "status")
 
     async def get_by_reference(self, *, reference: str) -> Transaction | None:
@@ -48,6 +49,47 @@ class TransactionRepository(BaseRepository[Transaction]):
         stmt = select(Transaction).where(Transaction.status.in_(statuses))
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def count_by_status(
+        self, *, tenant_id: UUID, transaction_type: str
+    ) -> dict[str, int]:
+        """Exact per-status counts for ONE tenant and ONE payment family —
+        the dashboard's summary cards need totals across the whole history,
+        which a paginated list response cannot give without the client
+        inventing numbers from a single page.
+
+        `transaction_type` is matched exactly, so a row that predates the
+        discriminator (NULL) is excluded rather than assumed — see the
+        a762b365749e migration."""
+        stmt = (
+            select(Transaction.status, func.count())
+            .where(
+                Transaction.tenant_id == tenant_id,
+                Transaction.transaction_type == transaction_type,
+            )
+            .group_by(Transaction.status)
+        )
+        result = await self.db.execute(stmt)
+        return {str(status): int(count) for status, count in result.all()}
+
+    async def list_by_type_paginated(
+        self, *, tenant_id: UUID, transaction_type: str, params: ListParams
+    ) -> tuple[list[Transaction], int]:
+        """Tenant- AND type-scoped page of transactions.
+
+        Reuses BaseRepository.list_paginated's own search/sort/filter
+        handling by pushing the type down as an ordinary exact-match
+        filter, so `status` filtering, sorting and the `total` count are
+        all evaluated INSIDE the type subset — a COMPLETED captive-portal
+        row can never be counted toward a Collection page."""
+        scoped = ListParams(
+            page=params.page,
+            page_size=params.page_size,
+            search=params.search,
+            sort=params.sort,
+            filters={**params.filters, "transaction_type": transaction_type},
+        )
+        return await self.list_paginated(tenant_id=tenant_id, params=scoped)
 
 
 class PaymentWebhookRepository(BaseRepository[PaymentWebhook]):

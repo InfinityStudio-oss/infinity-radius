@@ -84,6 +84,22 @@ class CollectionCreate(BaseModel):
     description: str | None = None
 
 
+class CollectionSummaryRead(BaseModel):
+    """Exact, tenant-scoped Collection counts for the dashboard's summary
+    cards. Grouped server-side because the client only ever holds one page
+    of the list and must never infer totals from it. `by_status` carries
+    every status actually present for this tenant — including any value a
+    future provider/status introduces — so the UI can render an honest
+    "other" bucket rather than silently dropping rows from its totals."""
+
+    total: int
+    completed: int
+    in_progress: int
+    requires_attention: int
+    failed: int
+    by_status: dict[str, int]
+
+
 class WalletRead(BaseModel):
     """A SUMMARIZED, current-state view — see TenantWallet's docstring.
     ledger_entries is the source of truth; this is a read-only cache."""

@@ -17,7 +17,7 @@ from uuid import UUID
 import pytest
 
 from app.core.config import get_settings
-from app.core.enums import CollectionStatus
+from app.core.enums import CollectionStatus, TransactionType
 from app.core.errors import DomainValidationError
 from app.db.session import AsyncSessionLocal
 from app.integrations.selcom_collection.client import SelcomCollectionClient
@@ -196,6 +196,23 @@ def test_initiate_collection_success_sends_stk_and_stores_transid(
     assert transaction.stk_requested_at is not None
     assert transaction.payer_phone == "255712345678"
     assert Decimal(transaction.amount) == _AMOUNT
+
+
+def test_initiate_collection_writes_the_collection_discriminator(
+    collection_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every Collection row must carry transaction_type explicitly — the
+    tenant Collections list and summary scope on it, and a row without it
+    would be invisible rather than misfiled."""
+    _fake_create_order_success(monkeypatch)
+    _fake_wallet_payment_success(monkeypatch)
+
+    with SeededContext() as ctx:
+        tenant_id, actor_id = _seed_tenant(ctx)
+        transaction_id = asyncio.run(_initiate(tenant_id=tenant_id, actor_id=actor_id))
+        transaction = asyncio.run(_get_transaction(transaction_id))
+
+    assert transaction.transaction_type == TransactionType.COLLECTION.value
 
 
 def test_initiate_collection_create_order_failure_marks_failed_without_sending_stk(

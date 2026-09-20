@@ -31,7 +31,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.enums import COLLECTION_TERMINAL_STATUSES, CollectionStatus
+from app.core.enums import COLLECTION_TERMINAL_STATUSES, CollectionStatus, TransactionType
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.phone import normalize_tz_phone
 from app.integrations.selcom_collection.client import SelcomCollectionClient
@@ -192,6 +192,7 @@ class CollectionService:
         transaction = await self.repo.create(
             tenant_id=tenant_id,
             customer_id=customer_id,
+            transaction_type=TransactionType.COLLECTION.value,
             reference=reference,
             amount=str(amount),
             currency=currency,

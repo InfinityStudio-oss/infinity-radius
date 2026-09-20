@@ -6,6 +6,7 @@ import {
   Package,
   Ticket,
   Receipt,
+  HandCoins,
   Wallet,
   Banknote,
   BarChart3,
@@ -37,6 +38,7 @@ export const DASHBOARD_SECTIONS: SidebarNavSection[] = [
   {
     title: "Finance & Admin",
     items: [
+      { label: "Collections", href: "/dashboard/finance/collections", icon: <HandCoins /> },
       { label: "Payments", href: "/dashboard/finance/payments", icon: <Receipt /> },
       { label: "Wallet", href: "/dashboard/finance/wallet", icon: <Wallet /> },
       { label: "Payouts", href: "/dashboard/finance/payouts", icon: <Banknote /> },

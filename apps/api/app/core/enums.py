@@ -115,6 +115,20 @@ class WithdrawalStatus(StrEnum):
     REVERSED = "REVERSED"  # a completed disbursement was later reversed
 
 
+class TransactionType(StrEnum):
+    """Which payment family a `transactions` row belongs to.
+
+    The table is shared by two unrelated flows, and everything else on the
+    row is a side effect rather than a classification (`channel` is NULL on
+    a Collection until it completes; phone/transid presence and reference
+    prefixes are brittle). Both writers set this explicitly — see the
+    a762b365749e migration for why nothing here relies on a DB default.
+    """
+
+    COLLECTION = "COLLECTION"  # Selcom Mobile Checkout — app/services/collections.py
+    CAPTIVE_PORTAL = "CAPTIVE_PORTAL"  # app/services/captive_portal.py
+
+
 class CollectionStatus(StrEnum):
     """A Selcom Mobile Checkout Collection order's lifecycle — see
     app/services/collections.py and app/integrations/selcom_collection/

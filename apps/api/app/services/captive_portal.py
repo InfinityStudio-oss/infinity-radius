@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.enums import PackageStatus
+from app.core.enums import PackageStatus, TransactionType
 from app.core.errors import DomainValidationError, NotFoundError
 from app.core.money import DEFAULT_CURRENCY
 from app.core.transaction_token import create_transaction_token, resolve_transaction_token
@@ -123,6 +123,7 @@ class CaptivePortalService:
             tenant_id=tenant_id,
             customer_id=customer.id,
             subscription_id=subscription.id,
+            transaction_type=TransactionType.CAPTIVE_PORTAL.value,
             reference=reference,
             channel="captive_portal",
             amount=str(amount),

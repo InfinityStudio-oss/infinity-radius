@@ -47,6 +47,11 @@ class Transaction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subscription_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True
     )
+    # app.core.enums.TransactionType — which payment family this row
+    # belongs to. Nullable only because the a762b365749e migration leaves
+    # unclassifiable historical rows NULL for review rather than guessing;
+    # every writer sets it explicitly, never via a DB default.
+    transaction_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     reference: Mapped[str] = mapped_column(Text, nullable=False)
     # PROVIDER-side evidence for a completed Collection, preferring the
     # payment channel's own transid (order-status `data.transid`, e.g.
